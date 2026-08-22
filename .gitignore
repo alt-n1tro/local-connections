@@ -1,0 +1,9 @@
+vectors.json
+vectors.json.tmp
+data.json
+check_vector.py
+test_main.js
+
+*.bak
+.DS_Store
+.claude/

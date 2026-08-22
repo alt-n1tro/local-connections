@@ -1,0 +1,712 @@
+.local-connections-panel {
+  padding: 0;
+  /* Fixed header + independently scrolling results. The panel fills the leaf and
+     lays out as a column: the header takes its natural height, the .lc-scroll
+     region takes the rest and scrolls on its own. This is what guarantees list
+     content can never render over the toolbar/tabs. */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* The one scrolling region. min-height:0 is required so a flex child is allowed
+   to shrink and scroll instead of growing to fit all its content. */
+.local-connections-panel .lc-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* section headers */
+.local-connections-panel .lc-section-header {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 12px 12px 6px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  position: sticky;
+  top: 0;
+  background: var(--background-secondary);
+  z-index: 1;
+}
+
+.local-connections-panel .lc-section-title {
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.local-connections-panel .lc-section-count {
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+}
+
+.local-connections-panel .lc-banner {
+  padding: 8px 12px;
+  font-size: var(--font-smallest);
+  color: var(--text-muted);
+  background: var(--background-modifier-hover);
+}
+
+.local-connections-panel .lc-empty {
+  padding: 12px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
+}
+
+/* ----- similar notes list ----- */
+.local-connections-panel .lc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 4px 6px 10px 6px;
+}
+
+.local-connections-panel .lc-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius-s);
+}
+
+.local-connections-panel .lc-item:hover {
+  background: var(--background-modifier-hover);
+}
+
+.local-connections-panel .lc-score {
+  flex: 0 0 auto;
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  min-width: 2.6em;
+  text-align: right;
+}
+
+.local-connections-panel .lc-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--font-ui-small);
+  line-height: 1.35;
+  color: var(--text-normal);
+  cursor: pointer;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+
+.local-connections-panel .lc-name:hover {
+  color: var(--text-accent);
+  text-decoration: underline;
+}
+
+/* score aligns to first line of a wrapped title */
+.local-connections-panel .lc-score {
+  padding-top: 1px;
+}
+
+.local-connections-panel .lc-copy {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  z-index: 1;   /* above its own row's text; the header is a separate flex box */
+  font-size: var(--font-smallest);
+  padding: 2px 7px;
+  height: auto;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+  box-shadow: none;
+  border: 1px solid var(--background-modifier-border-hover);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.local-connections-panel .lc-item:hover .lc-copy,
+.local-connections-panel .lc-block-item:hover .lc-copy {
+  opacity: 1;
+}
+
+.local-connections-panel .lc-copy:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-border-hover);
+}
+
+/* ----- similar blocks list ----- */
+.local-connections-panel .lc-block-list {
+  gap: 4px;
+}
+
+.local-connections-panel .lc-block-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+.local-connections-panel .lc-block-item:hover {
+  border-color: var(--background-modifier-border-hover);
+}
+
+.local-connections-panel .lc-block-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.local-connections-panel .lc-block-text {
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+  color: var(--text-normal);
+  padding-left: 2px;
+}
+
+/* a paragraph with more text than the preview shows is click-to-expand */
+.local-connections-panel .lc-block-expandable {
+  cursor: pointer;
+}
+
+.local-connections-panel .lc-block-text.lc-block-expandable:hover {
+  color: var(--text-accent);
+}
+
+.local-connections-panel .lc-current-block {
+  font-size: var(--font-smallest);
+  line-height: 1.4;
+  color: var(--text-muted);
+  padding-left: 2px;
+  border-top: 1px dashed var(--background-modifier-border);
+  padding-top: 4px;
+}
+
+.local-connections-panel .lc-current-label {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.local-connections-panel .lc-current-text {
+  color: var(--text-muted);
+}
+
+/* ----- gravity: one dotted cage around the whole group ----- */
+/* Grouping alone carries the meaning, so the rows inside stay visually
+   identical to every other note row — no per-row accent bar. */
+.local-connections-panel .lc-gravity-cage {
+  border: 1px dotted var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: 2px 0 4px 0;
+  margin: 2px 2px 8px 2px;
+}
+
+/* Doubles as the fold control for the whole section. */
+.local-connections-panel .lc-gravity-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--font-smallest);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  padding: 4px 8px 2px 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.local-connections-panel .lc-gravity-label:hover {
+  color: var(--text-muted);
+}
+
+.local-connections-panel .lc-gravity-caret {
+  flex: 0 0 auto;
+  font-size: var(--font-smallest);
+  line-height: 1;
+}
+
+/* how many rows are folded away, shown only while collapsed */
+.local-connections-panel .lc-gravity-hidden-count {
+  font-family: var(--font-monospace);
+  color: var(--text-faint);
+  opacity: 0.7;
+}
+
+/* ----- strange pairs sub-line (under the shared note row) ----- */
+/* Indented past the caret + score so it aligns under the note title. */
+.local-connections-panel .lc-strange-sub {
+  font-size: var(--font-smallest);
+  line-height: 1.4;
+  color: var(--text-faint);
+  padding: 0 8px 4px 3.9em;
+}
+
+/* ----- toolbar / pause button ----- */
+/* One sticky header holding the toolbar, search bar and tabs. Sticking them as
+   a single unit keeps the tabs pinned directly under the toolbar no matter how
+   tall it becomes when the buttons wrap. */
+.local-connections-panel .lc-header {
+  flex: 0 0 auto;            /* fixed height at the top; the results scroll below it */
+  background: var(--background-secondary);
+  position: relative;
+  z-index: 1;
+}
+
+.local-connections-panel .lc-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;  /* centered, and stays centered at any width */
+  flex-wrap: wrap;          /* narrow sidebar -> buttons wrap like text */
+  gap: 2px 4px;             /* row-gap column-gap */
+  padding: 2px 0 8px 0;       /* top 2px · right 0 · bottom 0 · left 0 */
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.local-connections-panel .lc-pause {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-smallest);
+  padding: 3px 4px;
+  height: auto;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-faint);
+  box-shadow: none;
+  border: none;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.local-connections-panel .lc-pause:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+
+.local-connections-panel .lc-pause-label {
+  line-height: 1;
+  /* Reserve the width of the wider word ("Paused") so toggling to "Live"
+     doesn't shrink the button and shove the rest of the toolbar around. */
+  display: inline-block;
+  min-width: 3.9em;
+  text-align: center;
+}
+
+.local-connections-panel .lc-paused-banner {
+  background: var(--background-secondary-alt, var(--background-modifier-hover));
+  color: var(--text-muted);
+  border-left: 2px solid var(--text-faint);
+  font-size: var(--font-smallest);
+  line-height: 1.4;
+}
+
+/* ----- tabs ----- */
+.local-connections-panel .lc-tabs {
+  display: flex;
+  gap: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.local-connections-panel .lc-tab {
+  flex: 1 1 0;     /* share the row evenly whether there are 2 or 3 tabs */
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 6px;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.local-connections-panel .lc-tab:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.local-connections-panel .lc-tab-active {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold);
+  border-bottom-color: var(--interactive-accent);
+}
+
+.local-connections-panel .lc-tab-count {
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+}
+
+.local-connections-panel .lc-tab-active .lc-tab-count {
+  color: var(--text-muted);
+}
+
+.local-connections-panel .lc-tab-body {
+  padding: 4px 0 10px 0;
+}
+
+/* ----- expandable note rows ----- */
+.local-connections-panel .lc-item-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.local-connections-panel .lc-caret {
+  flex: 0 0 auto;
+  width: 1.3em;
+  text-align: center;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  line-height: 1;
+  user-select: none;
+  transition: color 0.1s ease;
+}
+
+.local-connections-panel .lc-caret:hover {
+  color: var(--text-accent);
+}
+
+.local-connections-panel .lc-dropdown {
+  margin: 0 8px 4px 2.0em;
+  padding: 6px 10px;
+  border-left: 2px solid var(--interactive-accent);
+  background: var(--background-primary);
+  border-radius: var(--radius-s);
+}
+
+.local-connections-panel .lc-drop-title {
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+  margin-bottom: 4px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+/* only titles long enough to be cut off are clickable */
+.local-connections-panel .lc-drop-title-clipped {
+  cursor: pointer;
+}
+
+.local-connections-panel .lc-drop-title-clipped:hover {
+  color: var(--text-accent);
+}
+
+.local-connections-panel .lc-drop-body {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+/* ----- drift button (toolbar) ----- */
+.local-connections-panel .lc-drift-btn {
+  font-size: var(--font-smallest);
+  padding: 3px 4px;
+  height: auto;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-faint);
+  box-shadow: none;
+  border: none;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* ----- semantic search button (toolbar) ----- */
+.local-connections-panel .lc-search-btn {
+  font-size: var(--font-smallest);
+  padding: 3px 4px;
+  height: auto;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-faint);
+  box-shadow: none;
+  border: none;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.local-connections-panel .lc-search-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+
+.local-connections-panel .lc-search-btn.lc-search-active {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+}
+
+/* ----- already-linked marker (semantic search results) ----- */
+/* A quiet accent: a small dot after the title + a thin left rule on the row,
+   so notes you've already linked from the current note read as "handled"
+   without shouting. */
+.local-connections-panel .lc-linked-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  vertical-align: middle;
+  opacity: 0.85;
+}
+
+.local-connections-panel .lc-item.lc-linked {
+  box-shadow: inset 2px 0 0 var(--interactive-accent);
+}
+
+.local-connections-panel .lc-block-item.lc-linked {
+  border-left-color: var(--interactive-accent);
+}
+
+/* ----- semantic search bar ----- */
+.local-connections-panel .lc-search-bar {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.local-connections-panel .lc-search-input {
+  width: 100%;
+  font-size: var(--font-ui-small);
+  padding: 6px 8px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+}
+
+.local-connections-panel .lc-search-input:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+  box-shadow: 0 0 0 1px var(--interactive-accent);
+}
+
+/* ----- strange pairs: sort bar ----- */
+.local-connections-panel .lc-strange-sortbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px 6px 8px;
+}
+
+.local-connections-panel .lc-strange-sortlabel {
+  font-size: var(--font-smallest);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  margin-right: 2px;
+}
+
+.local-connections-panel .lc-strange-sortselect {
+  font-size: var(--font-smallest);
+  padding: 1px 20px 1px 8px;
+  height: auto;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: none;
+}
+
+.local-connections-panel .lc-strange-sortselect:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.local-connections-panel .lc-strange-sortselect:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+}
+
+.local-connections-panel .lc-drift-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+
+/* ----- drift modal ----- */
+.lc-drift-modal .lc-drift-title {
+  margin: 0 0 2px 0;
+  font-size: var(--font-ui-medium);
+}
+
+.lc-drift-modal .lc-drift-note {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 14px;
+  line-height: 1.4;
+}
+
+.lc-drift-modal .lc-drift-headline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+  margin-bottom: 8px;
+}
+
+.lc-drift-modal .lc-drift-label {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.lc-drift-modal .lc-drift-score-big {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+}
+
+.lc-drift-modal .lc-drift-hint {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  line-height: 1.4;
+  margin-bottom: 14px;
+}
+
+.lc-drift-modal .lc-drift-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lc-drift-modal .lc-drift-row {
+  padding: 8px 10px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.lc-drift-modal .lc-drift-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.lc-drift-modal .lc-drift-idx {
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+}
+
+.lc-drift-modal .lc-drift-score {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  color: var(--text-normal);
+}
+
+.lc-drift-modal .lc-drift-block-text {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.lc-drift-modal .lc-drift-empty {
+  padding: 14px 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
+}
+
+/* ============================================================================
+   Settings tab
+   ==========================================================================*/
+
+/* A short blurb under each category heading. */
+.lc-settings .lc-cat-desc {
+  margin: -0.4em 0 0.6em 0;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+/* The "⟳ Needs a re-embed" note appended to embedding-shape descriptions. */
+.lc-settings .lc-reembed-note {
+  color: var(--text-accent);
+  font-weight: var(--font-semibold);
+}
+
+/* Included-folders textarea: monospace + roomy so paths line up. */
+.lc-settings .lc-setting-folders .setting-item-control {
+  flex-basis: 100%;
+}
+.lc-settings textarea.lc-folders-input {
+  width: 100%;
+  min-height: 6em;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  resize: vertical;
+}
+
+/* Let folder rows stack the control under the label on narrow settings panes. */
+.lc-settings .lc-setting-folders {
+  flex-wrap: wrap;
+}
+
+/* ----- settings: About panel ----- */
+.lc-settings .lc-about {
+  line-height: 1.5;
+  margin-bottom: 1.4em;
+}
+.lc-settings .lc-about > p {
+  margin: 0 0 0.9em 0;
+}
+.lc-settings .lc-about-subhead {
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin: 0 0 0.5em 0;
+}
+/* term / definition pairs — term on its own line, definition indented under it */
+.lc-settings .lc-about-dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.35em 0.9em;
+}
+.lc-settings .lc-about-term {
+  color: var(--text-accent);
+  font-weight: var(--font-semibold);
+  white-space: nowrap;
+}
+.lc-settings .lc-about-def {
+  margin: 0;
+  color: var(--text-muted);
+}
+/* stack term over definition when the pane is narrow */
+@media (max-width: 620px) {
+  .lc-settings .lc-about-dl { grid-template-columns: 1fr; gap: 0.15em 0; }
+  .lc-settings .lc-about-def { margin: 0 0 0.5em 0; }
+}

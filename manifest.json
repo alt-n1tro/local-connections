@@ -1,0 +1,9 @@
+{
+  "id": "local-connections",
+  "name": "Local Connections",
+  "version": "1.0.0",
+  "minAppVersion": "1.1.0",
+  "description": "Find vectorspace relations between notes and blocks via a local Ollama embedding model.",
+  "author": "alt-n1tro",
+  "isDesktopOnly": true
+}
