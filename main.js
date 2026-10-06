@@ -292,10 +292,17 @@ function coerceSetting(item, raw, fallback) {
       return (item.options && Object.prototype.hasOwnProperty.call(item.options, raw)) ? raw : fallback;
     case 'text':
       return typeof raw === 'string' ? raw : (raw == null ? fallback : String(raw));
-    case 'folders':
-      if (Array.isArray(raw)) return raw.map((s) => String(s).trim()).filter(Boolean);
-      if (typeof raw === 'string') return raw.split('\n').map((s) => s.trim()).filter(Boolean);
+    case 'folders': {
+      // Strip surrounding slashes: isExcluded() matches on `folder + '/'`, so a
+      // pasted "5 - Permanent Notes/" would otherwise never match anything and
+      // silently index nothing.
+      const clean = (list) => list
+        .map((s) => String(s).trim().replace(/^\/+|\/+$/g, ''))
+        .filter(Boolean);
+      if (Array.isArray(raw)) return clean(raw);
+      if (typeof raw === 'string') return clean(raw.split('\n'));
       return Array.isArray(fallback) ? fallback.slice() : [];
+    }
     case 'int':
     case 'number':
     case 'slider': {
@@ -440,6 +447,22 @@ function truncate(str, n) {
   return s.length <= n ? s : s.slice(0, n - 1) + '\u2026';
 }
 
+// debounce() whose delay tracks TUNABLES[key] live. Obsidian's debounce bakes
+// the delay in at creation, so building it once in onload() meant edits to the
+// debounce settings did nothing until the plugin was reloaded.
+function liveDebounce(fn, key, resetTimer) {
+  let ms = null;
+  let d = null;
+  return (...args) => {
+    if (TUNABLES[key] !== ms) {
+      if (d && d.cancel) d.cancel();
+      ms = TUNABLES[key];
+      d = debounce(fn, ms, resetTimer);
+    }
+    return d(...args);
+  };
+}
+
 // ---------- plugin ----------
 
 module.exports = class LocalConnectionsPlugin extends Plugin {
@@ -482,9 +505,9 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     this.addSettingTab(new LocalConnectionsSettingTab(this.app, this));
 
     this.registerEvent(
-      this.app.workspace.on('active-leaf-change', debounce(() => {
+      this.app.workspace.on('active-leaf-change', liveDebounce(() => {
         this.refreshView();
-      }, TUNABLES.SWITCH_DEBOUNCE_MS, true))
+      }, 'SWITCH_DEBOUNCE_MS', true))
     );
 
     // Note edits. The debounced callback only ever fires with the LAST file of a
@@ -493,8 +516,8 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     // leave the other 299 stale. Instead every modify event records its path
     // immediately (undebounced), and the debounce merely schedules a flush of
     // the whole accumulated set.
-    const flushPending = debounce(() => { this.flushPending(); },
-      TUNABLES.MODIFY_DEBOUNCE_MS, true);
+    const flushPending = liveDebounce(() => { this.flushPending(); },
+      'MODIFY_DEBOUNCE_MS', true);
     this.registerEvent(
       this.app.vault.on('modify', (file) => this.handleTouched(file, flushPending))
     );
@@ -684,6 +707,12 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     if (this.unloaded) return;
     if (this.pending.size === 0) return;
     if (this.embedding) return;   // a full run is going; it'll flush us afterwards
+    // Model setting changed since the cache was built: embedding just these
+    // notes would mix two models' vectors. Hold them (still queued) until a
+    // re-embed or restart rebuilds the cache, or the setting is changed back.
+    // Not auto-rebuilding here on purpose: the model field commits on every
+    // keystroke, and a half-typed name must not wipe the cache.
+    if (this.storeModel !== TUNABLES.MODEL) return;
     if (this.paused) {
       for (const p of this.pending) this.dirtyWhilePaused.add(p);
       this.pending.clear();
@@ -740,17 +769,29 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       for (const p of paths) this.pending.add(p);
       return;
     }
+    if (this.storeModel !== TUNABLES.MODEL) { // see flushPending
+      for (const p of paths) this.pending.add(p);
+      return;
+    }
     this.embedding = true;
     this.embedError = null;
     let done = 0;
     const total = paths.length;
-    const notice = new Notice(`Local Connections: catching up 0/${total}\u2026`, 0);
+    const notice = new Notice(`Local Connections: catching up 0/${total}`, 0);
+    let stoppedByPause = false;
     try {
-      for (const path of paths) {
-        if (this.paused) break; // user paused again mid-catchup
+      for (let i = 0; i < paths.length; i++) {
+        const path = paths[i];
+        if (this.paused) {
+          // User paused again mid-catchup: hand the rest back to the paused set
+          // so the next resume picks them up instead of silently dropping them.
+          for (const p of paths.slice(i)) this.dirtyWhilePaused.add(p);
+          stoppedByPause = true;
+          break;
+        }
         const file = this.app.vault.getAbstractFileByPath(path);
         if (!(file instanceof TFile) || file.extension !== 'md') continue;
-        notice.setMessage(`Local Connections: catching up ${done}/${total}\u2026`);
+        notice.setMessage(`Local Connections: catching up ${done}/${total}`);
         const progress = this.makeBlockProgress(
           `Local Connections: catching up ${done}/${total}`,
           (msg) => notice.setMessage(msg)
@@ -771,7 +812,10 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
         if (done % TUNABLES.SAVE_EVERY_N === 0) await this.saveStore();
       }
       await this.saveStore();
-      if (!this.embedError) {
+      if (stoppedByPause) {
+        notice.setMessage(`Local Connections: paused at ${done}/${total}. Resume to continue.`);
+        setTimeout(() => notice.hide(), 4000);
+      } else if (!this.embedError) {
         notice.setMessage(`Local Connections: caught up (${done}/${total}).`);
         setTimeout(() => notice.hide(), 3000);
       }
@@ -838,6 +882,8 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     // for a newer store on a later launch.
     try { await this.app.vault.adapter.remove(this.tempStorePath); } catch (e) { /* none */ }
 
+    // Whatever we end up holding was built with (or is empty for) this model.
+    this.storeModel = TUNABLES.MODEL;
     if (!parsed || parsed.model !== TUNABLES.MODEL || !parsed.vectors) {
       this.store = {};
       return;
@@ -931,7 +977,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
 
   async _doSaveStore() {
     const payload = JSON.stringify({
-      model: TUNABLES.MODEL,
+      model: this.storeModel || TUNABLES.MODEL,
       format: STORE_FORMAT,
       updated_at: Date.now(),
       vectors: this.store,
@@ -976,7 +1022,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     let notice = null;
     const cb = (done, total) => {
       if (total <= TUNABLES.BATCH_SIZE) return; // fits in one request — stay quiet
-      const msg = `${prefix} (blocks ${done}/${total})…`;
+      const msg = `${prefix} (blocks ${done}/${total})`;
       if (update) { update(msg); return; }
       if (!notice) notice = new Notice(msg, 0);
       else notice.setMessage(msg);
@@ -1199,12 +1245,18 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     if (this.embedding) return;
     this.embedding = true;
     this.embedError = null;
-    if (force) this.store = {};
+    // A model change makes every cached vector incomparable with new ones (and
+    // same-width models wouldn't even trip the dimension check), so treat it as
+    // a forced rebuild rather than quietly mixing the two.
+    if (force || this.storeModel !== TUNABLES.MODEL) {
+      this.store = {};
+      this.storeModel = TUNABLES.MODEL;
+    }
 
     const files = this.app.vault.getMarkdownFiles().filter((f) => !this.isExcluded(f));
     const total = files.length;
     let done = 0, changed = 0;
-    const notice = new Notice(`Local Connections: embedding 0/${total}\u2026`, 0);
+    const notice = new Notice(`Local Connections: embedding 0/${total}`, 0);
 
     try {
       for (const file of files) {
@@ -1236,7 +1288,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
         if (this.store[file.path] !== before) changed++;
         done++;
         if (done % 5 === 0 || done === total) {
-          notice.setMessage(`Local Connections: embedding ${done}/${total}\u2026`);
+          notice.setMessage(`Local Connections: embedding ${done}/${total}`);
         }
         // Periodically flush to disk so a crash/close mid-run doesn't lose all
         // progress. On next launch, cached notes are skipped instantly.
@@ -2386,6 +2438,9 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
       case 'folders':
         s.addTextArea((t) => {
           t.setValue((Array.isArray(val) ? val : []).join('\n'));
+          // What the index was last built for, so merely clicking into the box
+          // and away again doesn't trigger a vault walk + notice.
+          let indexedFor = JSON.stringify(TUNABLES[item.key]);
           if (t.inputEl) {
             t.inputEl.rows = 6;
             t.inputEl.addClass('lc-folders-input');
@@ -2394,7 +2449,10 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
             t.inputEl.addEventListener('blur', () => {
               TUNABLES[item.key] = coerceSetting(item, t.getValue(), TUNABLE_DEFAULTS[item.key]);
               this.plugin.saveSettings();
-              new Notice('Local Connections: updating included folders…');
+              const now = JSON.stringify(TUNABLES[item.key]);
+              if (now === indexedFor) return;
+              indexedFor = now;
+              new Notice('Local Connections: updating included folders.');
               this.plugin.embedVault(false); // embed newly-included, prune removed
             });
           }
@@ -2413,7 +2471,7 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
       .setDesc('Rebuild all note + block vectors from scratch. Run this after changing the model or any of the length rules above (the ⟳ settings).')
       .addButton((b) => b.setButtonText('Re-embed').setCta().onClick(() => {
         this.plugin.embedVault(true);
-        new Notice('Local Connections: re-embedding the vault…');
+        new Notice('Local Connections: re-embedding the vault.');
       }));
   }
 }
