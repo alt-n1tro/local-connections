@@ -548,6 +548,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
 
     this.app.workspace.onLayoutReady(() => {
       if (!this.paused) this.embedVault(false);
+      else this.vaultScanOwed = true; // run it on resume instead
     });
   }
 
@@ -615,6 +616,20 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       // Resume: clear the stale "Paused" banner right away, before we start
       // catching up, so the panel reflects that embedding is now running.
       this.refreshView();
+      // A full-vault pass was cut short by the pause (or skipped because we
+      // started paused): finish it. Notes already embedded hit the mtime fast
+      // path, so this only does the remaining work — and it covers everything
+      // edited while paused too. Without this the rest of the vault stayed
+      // unembedded until the next app restart.
+      if (this.vaultScanOwed) {
+        for (const p of this.dirtyWhilePaused) this.pending.add(p);
+        this.dirtyWhilePaused.clear();
+        if (!this.embedding) await this.embedVault(false);
+        // else: the active run calls flushPending() when it ends, which picks
+        // the owed pass back up.
+        this.refreshView();
+        return;
+      }
       // Only embed what changed while paused — no full-vault rescan.
       const dirty = [...this.dirtyWhilePaused];
       this.dirtyWhilePaused.clear();
@@ -705,7 +720,6 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   // dropped. Paused is handled the same way, via dirtyWhilePaused.
   async flushPending() {
     if (this.unloaded) return;
-    if (this.pending.size === 0) return;
     if (this.embedding) return;   // a full run is going; it'll flush us afterwards
     // Model setting changed since the cache was built: embedding just these
     // notes would mix two models' vectors. Hold them (still queued) until a
@@ -713,6 +727,11 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     // Not auto-rebuilding here on purpose: the model field commits on every
     // keystroke, and a half-typed name must not wipe the cache.
     if (this.storeModel !== TUNABLES.MODEL) return;
+    // An interrupted vault pass is still owed: run it (it embeds every pending
+    // path along the way, and flushes anything left over when it ends). Checked
+    // before the empty-queue bail-out, since the owed pass may be all there is.
+    if (this.vaultScanOwed && !this.paused) return this.embedVault(false);
+    if (this.pending.size === 0) return;
     if (this.paused) {
       for (const p of this.pending) this.dirtyWhilePaused.add(p);
       this.pending.clear();
@@ -1245,6 +1264,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     if (this.embedding) return;
     this.embedding = true;
     this.embedError = null;
+    this.vaultScanOwed = false; // set again below if a pause cuts this run short
     // A model change makes every cached vector incomparable with new ones (and
     // same-width models wouldn't even trip the dimension check), so treat it as
     // a forced rebuild rather than quietly mixing the two.
@@ -1261,6 +1281,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     try {
       for (const file of files) {
         if (this.paused) {
+          this.vaultScanOwed = true; // resume picks the pass back up
           notice.setMessage(`Local Connections: paused at ${done}/${total}. Resume to continue.`);
           await this.saveStore();
           setTimeout(() => notice.hide(), 4000);
