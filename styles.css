@@ -327,7 +327,9 @@
   flex: 1 1 0;     /* share the row evenly whether there are 2 or 3 tabs */
   min-width: 0;
   display: flex;
-  align-items: center;
+  /* baseline, not center: the count is a smaller monospace font, and centring
+     its box leaves its text sitting visibly higher than the label's. */
+  align-items: baseline;
   justify-content: center;
   gap: 6px;
   padding: 8px 6px;
