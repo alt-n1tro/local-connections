@@ -2228,7 +2228,8 @@ class ConnectionsView extends ItemView {
       this._renderNoteRow(list, r, currentFile, linkedSet, 'lc-strange-row', {
         scoreText: r.delta.toFixed(dec),
         scoreTitle: 'Strangeness: how much more the bodies agree than the titles',
-        subText: `diff ${r.delta.toFixed(dec)} \u00b7 body ${r.raw.toFixed(dec)} \u00b7 title ${r.titleRaw.toFixed(dec)}`,
+        // No "diff" here: it's already the top-left number, whatever the sort.
+        subText: `body ${r.raw.toFixed(dec)} \u00b7 title ${r.titleRaw.toFixed(dec)}`,
       });
     }
   }
