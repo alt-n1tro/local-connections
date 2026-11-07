@@ -139,7 +139,7 @@ const TUNABLES = {
   INCLUDED_FOLDERS: [],
 
   // --- performance ---
-  SAVE_EVERY_N: 10,         // flush vectors.json to disk every N notes during a full embed
+  SAVE_EVERY_N: 10,         // flush vectors.bin to disk every N notes during a full embed
   SWITCH_DEBOUNCE_MS: 150,  // delay before recomputing on note-switch
   MODIFY_DEBOUNCE_MS: 800,  // delay before re-embedding an edited note
 };
@@ -372,7 +372,135 @@ const VIEW_TYPE = 'local-connections-view';
 //   v3: noteVec = embed(title + body), may be null for over-length docs.
 //   v4: adds bodyVec = embed(body) (for title-vs-body drift) and per-field
 //       titleHash / bodyHash for precise, cheap reuse. v2/v3 migrate in place.
-const STORE_FORMAT = 4;
+//   v5: (short-lived) vectors.json + a separate vectors-<id>.bin of float32s.
+//   v6: ONE file, vectors.bin. Written as JSON text, every number took ~21
+//       characters, so a vault of a few thousand notes produced a string longer
+//       than JavaScript allows (~512M chars) and saving silently failed. Binary
+//       is ~5x smaller on disk and half the memory. Older vectors.json files
+//       (v2-v5) are converted once at startup, checked number by number, and
+//       only then deleted (see convertLegacyStore).
+//
+// vectors.bin layout (little-endian):
+//   0   4 bytes  magic "LCVS"
+//   4   uint32   layout version (BIN_VERSION)
+//   8   uint32   metadata length in bytes
+//   12  uint32   number of floats
+//   16  uint32   checksum of everything after the header
+//   20  metadata: UTF-8 JSON { model, format, updated_at, floats, vectors },
+//       where every vector is [offset, length] into the float section
+//   ... zero padding to a multiple of 4
+//   ... the floats (float32), back to back
+const STORE_FORMAT = 6;
+const BIN_MAGIC = [0x4c, 0x43, 0x56, 0x53]; // "LCVS"
+const BIN_VERSION = 1;
+const BIN_HEADER = 20;
+
+// FNV-1a style hash: metadata byte by byte, then the floats 32 bits at a time
+// (fast enough for hundreds of MB). Catches a truncated, zero-filled or
+// half-synced file, so it's rejected instead of loaded.
+function storeChecksum(metaBytes, floatWords) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < metaBytes.length; i++) { h ^= metaBytes[i]; h = Math.imul(h, 0x01000193); }
+  for (let i = 0; i < floatWords.length; i++) { h ^= floatWords[i]; h = Math.imul(h, 0x01000193); }
+  return h >>> 0;
+}
+
+// ---- used to verify a converted store, number by number ----
+
+// Same bits, same length? (Bitwise, so even -0 / NaN must match exactly.)
+function sameFloats(a, b) {
+  if (a == null || b == null) return a === b;
+  if (!(b instanceof Float32Array) || a.length !== b.length) return false;
+  const fa = a instanceof Float32Array ? a : Float32Array.from(a);
+  const ua = new Uint32Array(fa.buffer, fa.byteOffset, fa.length);
+  const ub = new Uint32Array(b.buffer, b.byteOffset, b.length);
+  for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+  return true;
+}
+
+// JSON with sorted keys, for comparing metadata regardless of key order.
+function stableStringify(x) {
+  if (Array.isArray(x)) return '[' + x.map(stableStringify).join(',') + ']';
+  if (x && typeof x === 'object') {
+    return '{' + Object.keys(x).sort().map((k) => JSON.stringify(k) + ':' + stableStringify(x[k])).join(',') + '}';
+  }
+  return JSON.stringify(x === undefined ? null : x);
+}
+
+// Everything in a store entry except the vectors, which are compared separately.
+function entryMetadata(entry) {
+  const out = {};
+  for (const [k, v] of Object.entries(entry)) {
+    if (k === 'noteVec' || k === 'bodyVec' || k === 'titleVec') { out[k] = v == null ? v : 'vec'; continue; }
+    if (k === 'blocks' && Array.isArray(v)) {
+      out.blocks = v.map((b) => {
+        if (!b || typeof b !== 'object') return b;
+        const c = Object.assign({}, b);
+        if ('vec' in c) c.vec = c.vec == null ? c.vec : 'vec';
+        return c;
+      });
+      continue;
+    }
+    out[k] = v;
+  }
+  return stableStringify(out);
+}
+
+// Compare two in-memory stores completely: same notes, same metadata, and
+// every vector identical bit for bit. Returns { ok, vectors, reason }.
+function compareStores(a, b) {
+  const ka = Object.keys(a).sort();
+  const kb = Object.keys(b).sort();
+  if (ka.length !== kb.length) return { ok: false, reason: `note count ${ka.length} vs ${kb.length}` };
+  let vectors = 0;
+  for (let i = 0; i < ka.length; i++) {
+    const path = ka[i];
+    if (path !== kb[i]) return { ok: false, reason: `notes differ at "${path}"` };
+    const ea = a[path], eb = b[path];
+    if (entryMetadata(ea) !== entryMetadata(eb)) return { ok: false, reason: `metadata differs for "${path}"` };
+    for (const k of ['noteVec', 'bodyVec', 'titleVec']) {
+      if (!sameFloats(ea[k], eb[k])) return { ok: false, reason: `${k} differs for "${path}"` };
+      if (ea[k] != null) vectors++;
+    }
+    const ba = ea.blocks || [], bb = eb.blocks || [];
+    for (let j = 0; j < ba.length; j++) {
+      if (!sameFloats(ba[j] && ba[j].vec, bb[j] && bb[j].vec)) return { ok: false, reason: `paragraph ${j} vector differs for "${path}"` };
+      if (ba[j] && ba[j].vec != null) vectors++;
+    }
+  }
+  return { ok: true, vectors };
+}
+
+// Check every float in a converted store against the original JSON numbers
+// (each must equal that number rounded to float32). v2's noteVec is dropped
+// by design during migration, so it's the one vector allowed to be missing.
+function compareRawNumbers(raw, conv, format) {
+  if (!raw || typeof raw !== 'object') return { ok: false, reason: 'original numbers unavailable' };
+  const check = (orig, v, where) => {
+    if (!Array.isArray(orig)) return v == null || v === undefined ? null : `${where}: unexpected vector`;
+    if (!(v instanceof Float32Array) || v.length !== orig.length) return `${where}: missing or wrong length`;
+    for (let i = 0; i < orig.length; i++) {
+      if (!Object.is(Math.fround(orig[i]), v[i])) return `${where}: number ${i} differs`;
+    }
+    return null;
+  };
+  for (const [path, e] of Object.entries(raw)) {
+    const c = conv[path];
+    if (!e || !c) return { ok: false, reason: `"${path}" missing` };
+    for (const k of ['noteVec', 'bodyVec', 'titleVec']) {
+      if (k === 'noteVec' && format < 3) continue;
+      const err = check(e[k], c[k], `${k} of "${path}"`);
+      if (err) return { ok: false, reason: err };
+    }
+    const rb = e.blocks || [], cb = c.blocks || [];
+    if (rb.length !== cb.length) return { ok: false, reason: `paragraph count differs for "${path}"` };
+    for (let j = 0; j < rb.length; j++) {
+      const err = check(rb[j] && rb[j].vec, cb[j] && cb[j].vec, `paragraph ${j} of "${path}"`);
+      if (err) return { ok: false, reason: err };
+    }
+  }
+  return { ok: true };
+}
 
 // Version of the TEXT CLEANING rules in splitIntoBlocks().
 //
@@ -795,6 +923,33 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     this.embedVault(false);
   }
 
+  // How much is indexed, for the Live/Paused button's hover text. One pass over
+  // the index adding up paragraph counts: about 3 ms at 10k notes, run only
+  // when the panel re-renders. Memory is an estimate (each vector is 1,024
+  // float32s at 4 bytes, plus paragraph text), not a measurement.
+  storeStats() {
+    let notes = 0, paragraphs = 0, vectors = 0, chars = 0;
+    for (const entry of Object.values(this.store || {})) {
+      if (!entry) continue;
+      notes++;
+      if (entry.noteVec) vectors++;
+      if (entry.bodyVec) vectors++;
+      if (entry.titleVec) vectors++;
+      for (const b of entry.blocks || []) {
+        paragraphs++;
+        if (b.vec) vectors++;
+        chars += b.text ? b.text.length : 0;
+      }
+    }
+    const dim = TUNABLES.EXPECTED_DIM || 1024;
+    const mb = (vectors * dim * 4 + chars * 2) / (1024 * 1024);
+    const fmt = (n) => n.toLocaleString('en-US');
+    return {
+      notes, paragraphs, mb,
+      text: `${fmt(notes)} notes \u00B7 ${fmt(paragraphs)} paragraphs indexed (\u2248 ${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB in memory)`,
+    };
+  }
+
   // Has the user picked anything to index? With nothing picked, every note is
   // excluded, so a vault pass would prune the whole index: embedVault refuses
   // to run, and the panel asks for folders instead.
@@ -1005,46 +1160,239 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     await this.saveSettings();
   }
 
-  get storePath() {
-    return `${this.app.vault.configDir}/plugins/local-connections/vectors.json`;
+  get storeDir() {
+    return `${this.app.vault.configDir}/plugins/local-connections`;
   }
+  get storePath() { return `${this.storeDir}/vectors.bin`; }
+  get tempStorePath() { return this.storePath + '.tmp'; }
+  // Written by older versions; converted and removed at startup.
+  get legacyJsonPath() { return `${this.storeDir}/vectors.json`; }
+  get legacyJsonTmpPath() { return this.legacyJsonPath + '.tmp'; }
 
   async loadStore() {
-    // Try the real file; if it's missing or unreadable/corrupt, fall back to the
-    // scratch file a previous save may have left behind (we can be killed in the
-    // narrow window between removing the old file and renaming the new one in).
-    // Losing one save is fine; silently re-embedding the whole vault is not.
-    let parsed = await this._readStoreFile(this.storePath);
-    if (!parsed) {
-      parsed = await this._readStoreFile(this.tempStorePath);
-      if (parsed) console.warn('[Local Connections] recovered vector store from the scratch file');
-    }
-    // Any leftover scratch file is stale by now — drop it so it can't be mistaken
-    // for a newer store on a later launch.
-    try { await this.app.vault.adapter.remove(this.tempStorePath); } catch (e) { /* none */ }
-
-    // Whatever we end up holding was built with (or is empty for) this model.
     this.storeModel = TUNABLES.MODEL;
-    if (!parsed || parsed.model !== TUNABLES.MODEL || !parsed.vectors) {
-      this.store = {};
+    const adapter = this.app.vault.adapter;
+
+    // 1. The current file. If it's missing or fails its checks, fall back to
+    //    the scratch file a save may have left behind (killed between writing
+    //    it and swapping it in). Losing one save is fine; silently re-embedding
+    //    the whole vault is not.
+    let current = null;
+    let fromScratch = false;
+    for (const path of [this.storePath, this.tempStorePath]) {
+      current = await this._readBin(path);
+      if (current) { fromScratch = path !== this.storePath; break; }
+    }
+
+    // 2. An old vectors.json, if one is still around.
+    const legacy = await this._loadLegacy();
+
+    // The legacy file wins only if it's newer than what we have (no current
+    // file yet, a conversion that never finished, or an older plugin version
+    // was used in between). Otherwise it's a leftover.
+    if (legacy && (!current || legacy.updatedAt > current.updatedAt)) {
+      this.store = legacy.vectors;
+      await this.convertLegacyStore(legacy);
       return;
     }
-    if (parsed.format === STORE_FORMAT) {
-      this.store = parsed.vectors;
-    } else if (parsed.format === 2 || parsed.format === 3) {
-      this.migrateStore(parsed.vectors, parsed.format);
-      this.store = parsed.vectors;
+
+    this.store = current ? current.vectors : {};
+    if (fromScratch) {
+      // The scratch file was the only good copy: promote it now rather than
+      // wait for the next save, or a launch before that would find nothing.
+      // If that fails, it stays put and is recovered again next time.
+      try {
+        if (await adapter.exists(this.storePath)) await adapter.remove(this.storePath); // unusable anyway
+        await adapter.rename(this.tempStorePath, this.storePath);
+      } catch (e) { /* leave the scratch file for next time */ }
     } else {
-      this.store = {};
+      // Any leftover scratch file is stale by now.
+      try { await adapter.remove(this.tempStorePath); } catch (e) { /* none */ }
+    }
+    if (current && legacy) await this._deleteLegacy(); // older leftover
+  }
+
+  // Read and fully validate vectors.bin (or its scratch copy). Returns
+  // { vectors, updatedAt, floats } or null if absent, damaged, for another
+  // model, or inconsistent in any way.
+  async _readBin(path) {
+    let buf;
+    try { buf = await this.app.vault.adapter.readBinary(path); } catch (e) { return null; }
+    return this._decodeBin(buf);
+  }
+
+  _decodeBin(buf) {
+    try {
+      // Some adapters hand back a typed view (e.g. a Node Buffer) rather than a
+      // bare ArrayBuffer; take exactly its bytes.
+      if (buf && ArrayBuffer.isView(buf)) buf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+      if (!(buf instanceof ArrayBuffer) || buf.byteLength < BIN_HEADER) return null;
+      const u8 = new Uint8Array(buf);
+      for (let i = 0; i < 4; i++) if (u8[i] !== BIN_MAGIC[i]) return null;
+      const dv = new DataView(buf);
+      if (dv.getUint32(4, true) !== BIN_VERSION) return null;
+      const metaLen = dv.getUint32(8, true);
+      const count = dv.getUint32(12, true);
+      const floatStart = (BIN_HEADER + metaLen + 3) & ~3;
+      if (buf.byteLength !== floatStart + count * 4) return null; // truncated or padded
+      const metaBytes = u8.subarray(BIN_HEADER, BIN_HEADER + metaLen);
+      const words = new Uint32Array(buf, floatStart, count);
+      if (storeChecksum(metaBytes, words) !== dv.getUint32(16, true)) return null;
+      const meta = JSON.parse(new TextDecoder().decode(metaBytes));
+      if (!meta || meta.format !== STORE_FORMAT || meta.floats !== count) return null;
+      if (meta.model !== TUNABLES.MODEL || !meta.vectors || typeof meta.vectors !== 'object') return null;
+      const floats = new Float32Array(buf, floatStart, count);
+      if (!this._attachVectors(meta.vectors, floats)) return null;
+      return { vectors: meta.vectors, updatedAt: Number(meta.updated_at) || 0, floats: count };
+    } catch (e) {
+      return null;
     }
   }
 
-  // Read + parse one candidate store file. Returns null if absent or unparseable.
-  async _readStoreFile(path) {
+  // Replace every [offset, length] in `vectors` with a view into `floats`
+  // (no copying). False if any reference is malformed or out of range.
+  _attachVectors(vectors, floats) {
+    const view = (ref) => {
+      if (ref == null) return ref;
+      if (!Array.isArray(ref) || ref.length !== 2) return undefined;
+      const [o, n] = ref;
+      if (!Number.isInteger(o) || !Number.isInteger(n) || o < 0 || n < 0 || o + n > floats.length) return undefined;
+      return floats.subarray(o, o + n);
+    };
+    for (const entry of Object.values(vectors)) {
+      if (!entry || typeof entry !== 'object') return false;
+      for (const k of ['noteVec', 'bodyVec', 'titleVec']) {
+        if (!(k in entry)) continue;
+        const v = view(entry[k]);
+        if (v === undefined) return false;
+        entry[k] = v;
+      }
+      for (const blk of Array.isArray(entry.blocks) ? entry.blocks : []) {
+        if (!blk || !('vec' in blk)) continue;
+        const v = view(blk.vec);
+        if (v === undefined) return false;
+        blk.vec = v;
+      }
+    }
+    return true;
+  }
+
+  // ----- older vectors.json stores -----
+
+  // Load vectors.json (or its scratch copy) as written by an older version.
+  // Returns { vectors, updatedAt, format, path } or null.
+  async _loadLegacy() {
+    for (const path of [this.legacyJsonPath, this.legacyJsonTmpPath]) {
+      const parsed = await this._readJson(path);
+      if (!parsed) continue;
+      const vectors = await this._decodeLegacy(parsed);
+      if (vectors) return { vectors, updatedAt: Number(parsed.updated_at) || 0, format: parsed.format, path };
+    }
+    return null;
+  }
+
+  async _readJson(path) {
     try {
       return JSON.parse(await this.app.vault.adapter.read(path));
     } catch (e) {
       return null;
+    }
+  }
+
+  // Turn a parsed legacy vectors.json into an in-memory store (every vector a
+  // Float32Array), or null if it can't be used.
+  //   v2-v4: vectors inline as JSON arrays.
+  //   v5:    vectors as [offset, length] into the vectors-<id>.bin it names.
+  async _decodeLegacy(parsed) {
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.model !== TUNABLES.MODEL || !parsed.vectors || typeof parsed.vectors !== 'object') return null;
+    const vectors = parsed.vectors;
+    if (parsed.format === 5) {
+      if (typeof parsed.bin !== 'string' || !/^vectors-[a-z0-9]+\.bin$/.test(parsed.bin)) return null;
+      if (!Number.isInteger(parsed.floats) || parsed.floats < 0) return null;
+      let buf;
+      try { buf = await this.app.vault.adapter.readBinary(`${this.storeDir}/${parsed.bin}`); } catch (e) { return null; }
+      if (buf && ArrayBuffer.isView(buf)) buf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+      if (!buf || buf.byteLength !== parsed.floats * 4) return null;
+      return this._attachVectors(vectors, new Float32Array(buf)) ? vectors : null;
+    }
+    if (parsed.format === 4 || parsed.format === 3 || parsed.format === 2) {
+      if (parsed.format !== 4) this.migrateStore(vectors, parsed.format);
+      const f32 = (v) => (Array.isArray(v) ? Float32Array.from(v) : v);
+      for (const entry of Object.values(vectors)) {
+        if (!entry || typeof entry !== 'object') return null;
+        for (const k of ['noteVec', 'bodyVec', 'titleVec']) if (k in entry) entry[k] = f32(entry[k]);
+        for (const blk of Array.isArray(entry.blocks) ? entry.blocks : []) if (blk && 'vec' in blk) blk.vec = f32(blk.vec);
+      }
+      return vectors;
+    }
+    return null;
+  }
+
+  // One-time conversion of an old vectors.json to vectors.bin. The old file is
+  // deleted only after the new one has been written, read back from disk, and
+  // compared with the old file, re-read independently: every note, every
+  // metadata field and every single number, bit for bit. If anything differs
+  // (or can't be checked), the old file stays, vectors.bin is removed, and
+  // nothing is saved for the rest of the session, so the old file is still
+  // the source of truth and the conversion is retried next launch.
+  async convertLegacyStore(legacy) {
+    let result;
+    try {
+      result = await this._writeAndVerify(legacy);
+    } catch (e) {
+      result = { ok: false, reason: e && e.message ? e.message : String(e) };
+    }
+    if (result.ok) {
+      await this._deleteLegacy();
+      console.info(`[Local Connections] converted vectors.json to vectors.bin; verified ${result.checked} vectors`);
+      new Notice(`Local Connections: index converted to the new format (${result.checked.toLocaleString('en-US')} vectors checked).`, 6000);
+      return true;
+    }
+    console.error('[Local Connections] index conversion failed verification; keeping vectors.json:', result.reason);
+    this._saveBlocked = true;
+    try { await this.app.vault.adapter.remove(this.storePath); } catch (e) { /* may not exist */ }
+    new Notice('Local Connections: couldn’t verify the converted index, so the old file was kept. It’ll try again next launch.', 10000);
+    return false;
+  }
+
+  async _writeAndVerify(legacy) {
+    // 1. Write vectors.bin from the store loaded out of the old file.
+    if (!(await this._doSaveStore())) return { ok: false, reason: 'writing vectors.bin failed' };
+
+    // 2. Read it back from disk, through the normal validating loader.
+    const disk = await this._readBin(this.storePath);
+    if (!disk) return { ok: false, reason: 'vectors.bin could not be read back' };
+
+    // 3. Decode the old file again from scratch and compare everything.
+    const fresh = await this._decodeLegacy(await this._readJson(legacy.path));
+    if (!fresh) return { ok: false, reason: 'old file could not be re-read' };
+    const cmp = compareStores(fresh, disk.vectors);
+    if (!cmp.ok) return { ok: false, reason: cmp.reason };
+
+    // 4. For inline-number files, also check every float against the original
+    //    JSON number itself (catches a fault in the conversion step, which
+    //    steps 1-3 share).
+    if (legacy.format >= 2 && legacy.format <= 4) {
+      const raw = await this._readJson(legacy.path);
+      const r = compareRawNumbers(raw && raw.vectors, disk.vectors, legacy.format);
+      if (!r.ok) return { ok: false, reason: r.reason };
+    }
+    return { ok: true, checked: cmp.vectors };
+  }
+
+  // Remove vectors.json, its scratch copy, and any v5 vectors-<id>.bin.
+  async _deleteLegacy() {
+    const adapter = this.app.vault.adapter;
+    for (const path of [this.legacyJsonPath, this.legacyJsonTmpPath]) {
+      try { if (await adapter.exists(path)) await adapter.remove(path); } catch (e) { /* retried next launch */ }
+    }
+    if (!adapter.list) return;
+    let listing;
+    try { listing = await adapter.list(this.storeDir); } catch (e) { return; }
+    for (const full of (listing && listing.files) || []) {
+      if (!/^vectors-[a-z0-9]+\.bin$/.test(full.split('/').pop())) continue;
+      try { await adapter.remove(full); } catch (e) { /* retried next launch */ }
     }
   }
 
@@ -1075,20 +1423,16 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     }
   }
 
-  get tempStorePath() {
-    return this.storePath + '.tmp';
-  }
-
   // Persist the vector store.
   //
   // Two protections, both learned the hard way:
   //
-  // 1. ATOMIC WRITE. vectors.json can be tens of MB, so a plain overwrite has a
+  // 1. ATOMIC WRITE. vectors.bin can be hundreds of MB, so a plain overwrite has a
   //    real window where the process can die mid-write, leaving a truncated file
   //    that won't parse — which makes the next launch silently discard the whole
   //    cache and re-embed the entire vault. Instead we write a .tmp file and
   //    rename it over the real one. A rename is atomic: if we're killed, the
-  //    worst case is a stale-but-valid vectors.json plus a junk .tmp.
+  //    worst case is a stale-but-valid vectors.bin plus a junk .tmp.
   //
   // 2. ONE WRITER AT A TIME. Several paths save (the vault run every N notes, the
   //    modify handler, rename, resume). Overlapping writes would interleave into
@@ -1116,37 +1460,98 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     }
   }
 
-  async _doSaveStore() {
-    const payload = JSON.stringify({
+  // Lay the store out as vectors.bin (see the layout above STORE_FORMAT).
+  // Two passes over the store: the first assigns every vector its offset (so
+  // the metadata can be written), the second copies the numbers straight into
+  // the output buffer — no intermediate copy of all the floats.
+  _encodeStore() {
+    const order = [];
+    let total = 0;
+    const ref = (v) => {
+      if (!v) return v; // null stays null (e.g. an over-length note's noteVec)
+      order.push(v);
+      const r = [total, v.length];
+      total += v.length;
+      return r;
+    };
+    const vectors = {};
+    for (const [path, entry] of Object.entries(this.store)) {
+      if (!entry) continue;
+      const out = Object.assign({}, entry);
+      for (const k of ['noteVec', 'bodyVec', 'titleVec']) if (k in entry) out[k] = ref(entry[k]);
+      if (Array.isArray(entry.blocks)) {
+        out.blocks = entry.blocks.map((blk) => (blk && 'vec' in blk ? Object.assign({}, blk, { vec: ref(blk.vec) }) : blk));
+      }
+      vectors[path] = out;
+    }
+    const metaBytes = new TextEncoder().encode(JSON.stringify({
       model: this.storeModel || TUNABLES.MODEL,
       format: STORE_FORMAT,
       updated_at: Date.now(),
-      vectors: this.store,
-    });
+      floats: total,
+      vectors,
+    }));
+    const floatStart = (BIN_HEADER + metaBytes.length + 3) & ~3;
+    const buf = new ArrayBuffer(floatStart + total * 4);
+    const u8 = new Uint8Array(buf);
+    u8.set(BIN_MAGIC, 0);
+    u8.set(metaBytes, BIN_HEADER);
+    const floats = new Float32Array(buf, floatStart, total);
+    let at = 0;
+    for (const v of order) { floats.set(v, at); at += v.length; }
+    const dv = new DataView(buf);
+    dv.setUint32(4, BIN_VERSION, true);
+    dv.setUint32(8, metaBytes.length, true);
+    dv.setUint32(12, total, true);
+    dv.setUint32(16, storeChecksum(metaBytes, new Uint32Array(buf, floatStart, total)), true);
+    return buf;
+  }
+
+  // Returns true once vectors.bin on disk holds the current store.
+  async _doSaveStore() {
+    // A conversion that failed its checks: the old vectors.json is still the
+    // source of truth, so don't write anything until it's retried next launch.
+    if (this._saveBlocked) return false;
     const adapter = this.app.vault.adapter;
+    let buf;
+    try {
+      buf = this._encodeStore();
+    } catch (e) {
+      console.error('[Local Connections] failed to encode vector store', e);
+      return false;
+    }
     try {
       // Write to a scratch file first, then swap it in.
-      await adapter.write(this.tempStorePath, payload);
+      await adapter.writeBinary(this.tempStorePath, buf);
       if (adapter.rename) {
         try {
           // Preferred: a single atomic swap, no window where the real file is missing.
           await adapter.rename(this.tempStorePath, this.storePath);
         } catch (e) {
           // Some adapters refuse to rename onto an existing file. Only then do we
-          // clear the target first. This leaves a brief window where vectors.json
+          // clear the target first. This leaves a brief window where vectors.bin
           // is absent — loadStore() can recover from the .tmp if we die here.
           await adapter.remove(this.storePath);
           await adapter.rename(this.tempStorePath, this.storePath);
         }
       } else {
-        // No rename support: fall back to a direct write (pre-existing behavior).
-        await adapter.write(this.storePath, payload);
+        // No rename support: fall back to a direct write.
+        await adapter.writeBinary(this.storePath, buf);
         try { await adapter.remove(this.tempStorePath); } catch (e) { /* ignore */ }
       }
+      return true;
     } catch (e) {
       console.error('[Local Connections] failed to save vector store', e);
-      // Never leave a half-written scratch file lying around.
-      try { await adapter.remove(this.tempStorePath); } catch (e2) { /* ignore */ }
+      // If vectors.bin is gone (we cleared it for a rename that then failed),
+      // the scratch file is the only copy: keep it, and loadStore() recovers
+      // from it. Otherwise the file on disk is untouched and valid, so drop
+      // the half-done scratch file.
+      let realExists = true;
+      try { realExists = await adapter.exists(this.storePath); } catch (e2) { /* assume it does */ }
+      if (realExists) {
+        try { await adapter.remove(this.tempStorePath); } catch (e2) { /* ignore */ }
+      }
+      return false;
     }
   }
 
@@ -1208,17 +1613,19 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   // Reject a vector whose width isn't what the rest of the store uses. Mixing
   // dimensions is silent poison: cosine() returns -1 for mismatched lengths, so
   // affected notes simply stop matching anything, with no error anywhere.
+  // Also converts it to a Float32Array, the in-memory (and on-disk) form of
+  // every vector: half the memory of a plain array of doubles, and the model's
+  // own precision anyway.
   _checkDim(vec) {
     const want = TUNABLES.EXPECTED_DIM;
-    if (!want) return vec;
     if (!Array.isArray(vec)) throw new Error('Ollama returned a non-array embedding');
-    if (vec.length !== want) {
+    if (want && vec.length !== want) {
       throw new Error(
         `Ollama returned a ${vec.length}-dim embedding, expected ${want}. ` +
         `Wrong model, or "${TUNABLES.MODEL}" changed — re-embed the vault after fixing it.`
       );
     }
-    return vec;
+    return Float32Array.from(vec);
   }
 
   async embedText(text) {
@@ -1888,14 +2295,15 @@ class ConnectionsView extends ItemView {
       cls: 'lc-pause' + (showPaused ? ' lc-paused' : ''),
     });
     pauseBtn.createSpan({ cls: 'lc-pause-label', text: showPaused ? 'Paused' : 'Live' });
-    pauseBtn.setAttr(
-      'title',
-      noFolders
-        ? 'No folders chosen yet. Click to choose what to index.'
-        : this.plugin.paused
-          ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
-          : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.'
-    );
+    // Hover text only: how much is indexed, under the usual hint. Nothing is
+    // shown in the panel itself.
+    const hint = noFolders
+      ? 'No folders chosen yet. Click to choose what to index.'
+      : this.plugin.paused
+        ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
+        : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.';
+    const stats = this.plugin.storeStats();
+    pauseBtn.setAttr('title', stats.notes > 0 ? `${hint}\n\n${stats.text}` : hint);
     pauseBtn.addEventListener('click', () => {
       this.plugin.togglePause();
       // togglePause flips paused synchronously, but its refreshView() skips
