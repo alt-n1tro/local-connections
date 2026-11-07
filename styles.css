@@ -314,6 +314,14 @@
   line-height: 1.4;
 }
 
+/* "Choose folders" prompt in the panel when nothing is picked yet. */
+.local-connections-panel .lc-setup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
 /* ----- tabs ----- */
 .local-connections-panel .lc-tabs {
   display: flex;
@@ -668,9 +676,8 @@
   font-weight: var(--font-semibold);
 }
 
-/* ----- settings: folder picker ----- */
-.lc-settings .lc-folder-tree {
-  margin: -0.25em 0 1em 0;
+/* ----- folder tree (settings + "choose folders" pop-up) ----- */
+.lc-folder-tree {
   padding: 4px 0;
   max-height: 340px;
   overflow-y: auto;
@@ -679,10 +686,13 @@
   background: var(--background-secondary);
   font-size: var(--font-ui-small);
 }
-.lc-settings .lc-hidden {
+.lc-folder-tree.lc-hidden {
   display: none;
 }
-.lc-settings .lc-folder-row {
+.lc-folder-tree .lc-folder-tree {
+  margin: -0.25em 0 1em 0;
+}
+.lc-folder-tree .lc-folder-row {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -690,21 +700,21 @@
   padding-bottom: 2px;
   padding-right: 10px;
 }
-.lc-settings .lc-folder-row:hover {
+.lc-folder-tree .lc-folder-row:hover {
   background: var(--background-modifier-hover);
 }
-.lc-settings .lc-folder-caret {
+.lc-folder-tree .lc-folder-caret {
   flex: 0 0 1.1em;
   text-align: center;
   color: var(--text-faint);
 }
-.lc-settings .lc-folder-caret-active {
+.lc-folder-tree .lc-folder-caret-active {
   cursor: pointer;
 }
-.lc-settings .lc-folder-caret-active:hover {
+.lc-folder-tree .lc-folder-caret-active:hover {
   color: var(--text-normal);
 }
-.lc-settings .lc-folder-label {
+.lc-folder-tree .lc-folder-label {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
@@ -712,31 +722,56 @@
   gap: 6px;
   cursor: pointer;
 }
-.lc-settings .lc-folder-label input {
+.lc-folder-tree .lc-folder-label input {
   margin: 0;
   flex: 0 0 auto;
 }
-.lc-settings .lc-folder-label input:disabled {
+.lc-folder-tree .lc-folder-label input:disabled {
   opacity: 0.55;
 }
-.lc-settings .lc-folder-name {
+.lc-folder-tree .lc-folder-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.lc-settings .lc-folder-note {
+.lc-folder-tree .lc-folder-note {
   color: var(--text-error);
   font-size: var(--font-ui-smaller);
 }
-.lc-settings .lc-folder-missing .lc-folder-name {
+.lc-folder-tree .lc-folder-tag {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-accent);
+}
+.lc-folder-tree .lc-folder-missing .lc-folder-name {
   color: var(--text-muted);
   text-decoration: line-through;
 }
-.lc-settings .lc-folder-count {
+.lc-folder-tree .lc-folder-count {
   flex: 0 0 auto;
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   color: var(--text-faint);
+}
+
+/* The pop-up shown when no folders are picked. */
+.lc-folder-modal .lc-folder-modal-text {
+  margin-top: 0;
+  color: var(--text-muted);
+}
+.lc-folder-modal .lc-folder-tree {
+  max-height: 50vh;
+}
+.lc-folder-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 1em;
+}
+.lc-folder-modal-footer .lc-folder-modal-status {
+  margin-right: auto;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
 }
 
 /* Current value shown beside each slider. */

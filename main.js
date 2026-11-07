@@ -133,10 +133,10 @@ const TUNABLES = {
   // else is skipped. Whether a note gets a whole-note vector is decided purely
   // by length (NOTE_EMBED_MAX_CHARS), not by folder — long docs (e.g. YouTube
   // transcripts) get block vectors only, with noteVec stored as null.
-  // "/" means the entire vault. Pick folders in the settings tab's folder tree.
-  INCLUDED_FOLDERS: [
-    '5 - Permanent Notes',
-  ],
+  // "/" means the entire vault. Empty = nothing chosen yet: indexing doesn't
+  // run at all (and nothing is pruned) until folders are picked, and the user
+  // is asked to pick some. Pick folders in the settings tab's folder tree.
+  INCLUDED_FOLDERS: [],
 
   // --- performance ---
   SAVE_EVERY_N: 10,         // flush vectors.json to disk every N notes during a full embed
@@ -542,7 +542,12 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     this.addCommand({
       id: 'reembed-all',
       name: 'Re-embed entire vault',
-      callback: () => this.embedVault(true),
+      callback: () => this.reembedAll(),
+    });
+    this.addCommand({
+      id: 'choose-folders',
+      name: 'Choose folders to index',
+      callback: () => this.openFolderPrompt(),
     });
     this.addCommand({
       id: 'toggle-pause-embedding',
@@ -595,6 +600,17 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     );
 
     this.app.workspace.onLayoutReady(() => {
+      // Nothing chosen yet: stay idle (the panel shows "Paused" and a "Choose
+      // folders" button). Pop the chooser up on its own only the very first
+      // time, so dismissing it doesn't mean seeing it on every launch.
+      if (!this.hasFolders()) {
+        if (!this.folderPrompted) {
+          this.folderPrompted = true;
+          this.saveSettings();
+          this.openFolderPrompt();
+        }
+        return;
+      }
       if (!this.paused) this.embedVault(false);
       else this.vaultScanOwed = true; // run it on resume instead
     });
@@ -612,7 +628,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
           return;
         }
         const moved = this.store[oldPath];
-        if (moved) {
+        if (moved && oldPath !== file.path) {
           this.store[file.path] = moved;
           delete this.store[oldPath];
         }
@@ -621,6 +637,8 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
           this.dirtyWhilePaused.add(file.path);
         }
         if (file.extension !== 'md') { this.refreshView(); return; }
+        // Nothing picked to index: keep the (moved) entry as-is, embed nothing.
+        if (!this.hasFolders()) { this.refreshView(); return; }
 
         // Renamed out of the allowlist (moved into an excluded folder): the moved
         // entry would otherwise linger as a ghost, still showing up in results
@@ -656,6 +674,9 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   }
 
   async togglePause() {
+    // Nothing to resume into: ask for folders. "Start indexing" in the pop-up
+    // then resumes for real.
+    if (!this.hasFolders()) { this.openFolderPrompt(); return; }
     this.paused = !this.paused;
     await this.saveSettings();
     if (this.paused) {
@@ -764,6 +785,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   // flushPending), so a folder ticked mid-run still gets indexed.
   requestVaultScan() {
     if (this.unloaded) return;
+    if (!this.hasFolders()) { this.refreshView(); return; }
     if (this.paused || this.embedding) {
       this.vaultScanOwed = true;
       if (this.paused) new Notice('Local Connections: folders saved. They\u2019ll be indexed when you resume.');
@@ -771,6 +793,29 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       return;
     }
     this.embedVault(false);
+  }
+
+  // Has the user picked anything to index? With nothing picked, every note is
+  // excluded, so a vault pass would prune the whole index: embedVault refuses
+  // to run, and the panel asks for folders instead.
+  hasFolders() {
+    return Array.isArray(TUNABLES.INCLUDED_FOLDERS) && TUNABLES.INCLUDED_FOLDERS.length > 0;
+  }
+
+  // The "choose folders" pop-up. At most one at a time, so the first-launch
+  // prompt, the Paused button and the panel's button can't stack copies of it.
+  openFolderPrompt() {
+    if (this.unloaded || this.folderModal) return;
+    this.folderModal = new FolderPromptModal(this.app, this);
+    this.folderModal.open();
+  }
+
+  // Re-embed everything (button and command). With no folders there's nothing
+  // to rebuild, and force-clearing the store first would just lose it.
+  reembedAll() {
+    if (!this.hasFolders()) { this.openFolderPrompt(); return false; }
+    this.embedVault(true);
+    return true;
   }
 
   // Drop every cached entry (and queued path) beneath a deleted folder.
@@ -934,11 +979,12 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       }
     }
     this.paused = !!saved.paused;
+    this.folderPrompted = !!saved.folderPrompted;
   }
 
   // The persisted shape: every schema key's current TUNABLES value, plus paused.
   collectSettings() {
-    const out = { paused: this.paused };
+    const out = { paused: this.paused, folderPrompted: !!this.folderPrompted };
     for (const item of SETTINGS_ITEMS) out[item.key] = TUNABLES[item.key];
     return out;
   }
@@ -948,8 +994,11 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   }
 
   // Restore every setting to its literal default (used by the settings tab).
+  // The folder choice is kept: it's what you index, not a tuning knob, and
+  // resetting it would leave nothing selected.
   async resetSettings() {
     for (const item of SETTINGS_ITEMS) {
+      if (item.key === 'INCLUDED_FOLDERS') continue;
       const def = TUNABLE_DEFAULTS[item.key];
       TUNABLES[item.key] = Array.isArray(def) ? def.slice() : def;
     }
@@ -1336,6 +1385,10 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   async embedVault(force) {
     if (this.unloaded) return;
     if (this.embedding) return;
+    // No folders picked: every note counts as excluded, so this pass would
+    // prune (or, forced, wipe) the entire index. Do nothing; the panel shows a
+    // "Choose folders" prompt. Checked before the store is touched.
+    if (!this.hasFolders()) { this.refreshView(); return; }
     this.embedding = true;
     this.embedError = null;
     this.vaultScanOwed = false; // set again below if a pause cuts this run short
@@ -1827,15 +1880,21 @@ class ConnectionsView extends ItemView {
     const header = container.createDiv({ cls: 'lc-header' });
     this._header = header;
     const toolbar = header.createDiv({ cls: 'lc-toolbar' });
+    // With no folders picked there's nothing to run, so it reads as paused;
+    // clicking it then opens the folder pop-up (see togglePause).
+    const noFolders = !this.plugin.hasFolders();
+    const showPaused = this.plugin.paused || noFolders;
     const pauseBtn = toolbar.createEl('button', {
-      cls: 'lc-pause' + (this.plugin.paused ? ' lc-paused' : ''),
+      cls: 'lc-pause' + (showPaused ? ' lc-paused' : ''),
     });
-    pauseBtn.createSpan({ cls: 'lc-pause-label', text: this.plugin.paused ? 'Paused' : 'Live' });
+    pauseBtn.createSpan({ cls: 'lc-pause-label', text: showPaused ? 'Paused' : 'Live' });
     pauseBtn.setAttr(
       'title',
-      this.plugin.paused
-        ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
-        : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.'
+      noFolders
+        ? 'No folders chosen yet. Click to choose what to index.'
+        : this.plugin.paused
+          ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
+          : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.'
     );
     pauseBtn.addEventListener('click', () => {
       this.plugin.togglePause();
@@ -1878,6 +1937,16 @@ class ConnectionsView extends ItemView {
         cls: 'lc-empty',
         text: `Embedding error: ${this.plugin.embedError}. Check that Ollama is running and "${TUNABLES.MODEL}" is pulled.`,
       });
+      return;
+    }
+
+    // Nothing to index yet: say so, with a way to fix it, instead of a blank
+    // panel or a misleading "not embedded yet".
+    if (!this.plugin.hasFolders()) {
+      const box = scroll.createDiv({ cls: 'lc-empty lc-setup' });
+      box.createDiv({ text: 'Choose which folders to index to get started.' });
+      const choose = box.createEl('button', { cls: 'mod-cta lc-setup-btn', text: 'Choose folders' });
+      choose.addEventListener('click', () => this.plugin.openFolderPrompt());
       return;
     }
 
@@ -2439,6 +2508,213 @@ class DriftModal extends Modal {
 
 // ---------- settings ----------
 
+// ---------- folder tree (settings + pop-up) ----------
+
+// Checkbox tree of every folder in the vault, with note counts. Ticking a
+// folder includes everything below it, so its subfolders show ticked and
+// locked. "Entire vault" is stored as "/". Saves nothing itself: it reads the
+// selection from getSelected() and hands a new list to onChange().
+class FolderTree {
+  constructor(app, el, { getSelected, onChange, expanded, suggested }) {
+    this.app = app;
+    this.suggested = suggested || null;
+    this.el = el;
+    this.getSelected = getSelected;
+    this.onChange = onChange;
+    this.expanded = expanded || new Set();
+    el.addClass('lc-folder-tree');
+  }
+
+  // Open the branches leading to the ticked folders, so you can see your
+  // selection without digging for it.
+  static expandedFor(selected) {
+    const out = new Set();
+    for (const f of selected || []) {
+      const parts = f.split('/');
+      for (let i = 1; i < parts.length; i++) out.add(parts.slice(0, i).join('/'));
+    }
+    return out;
+  }
+
+  static summary(selected) {
+    if (!selected || selected.length === 0) return 'Choose folders';
+    if (selected.includes('/')) return 'Entire vault';
+    if (selected.length === 1) return selected[0].split('/').pop();
+    return `${selected.length} folders`;
+  }
+
+  // The ticked folder that covers `path` (itself or an ancestor), if any.
+  coveredBy(path) {
+    const sel = this.getSelected();
+    if (sel.includes('/')) return '/';
+    for (const f of sel) if (path === f || path.startsWith(f + '/')) return f;
+    return null;
+  }
+
+  toggle(path, on) {
+    let next = this.getSelected().filter((f) => f !== path);
+    if (on) {
+      // A tick makes ticks below it redundant; "Entire vault" replaces all.
+      next = path === '/' ? [] : next.filter((f) => !f.startsWith(path + '/'));
+      next.push(path);
+    }
+    this.onChange(next);
+  }
+
+  render() {
+    const vault = this.app.vault;
+    // Notes per folder, counting everything below it. Recounted on each render
+    // so the numbers follow notes added while the tree is open.
+    this.counts = new Map();
+    for (const f of vault.getMarkdownFiles()) {
+      for (let dir = f.parent; dir; dir = dir.parent) {
+        this.counts.set(dir.path, (this.counts.get(dir.path) || 0) + 1);
+      }
+    }
+    this.el.empty();
+    // Ticked folders that no longer exist (deleted, or renamed outside
+    // Obsidian) come first, so they can be unticked.
+    for (const f of this.getSelected()) {
+      if (f === '/' || vault.getAbstractFileByPath(f) instanceof TFolder) continue;
+      this.addRow({ path: f, label: f, depth: 0, hasKids: false, count: null, missing: true });
+    }
+    const root = vault.getRoot();
+    this.addRow({ path: '/', label: 'Entire vault', depth: 0, hasKids: false, count: this.counts.get(root.path) || 0 });
+    for (const k of this.subfolders(root)) this.addFolder(k, 0);
+  }
+
+  subfolders(folder) {
+    return (folder.children || [])
+      .filter((c) => c instanceof TFolder)
+      .sort((x, y) => x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: 'base' }));
+  }
+
+  addFolder(folder, depth) {
+    const kids = this.subfolders(folder);
+    const open = this.addRow({
+      path: folder.path, label: folder.name, depth, hasKids: kids.length > 0,
+      count: this.counts.get(folder.path) || 0,
+    });
+    if (open) for (const k of kids) this.addFolder(k, depth + 1);
+  }
+
+  addRow({ path, label, depth, hasKids, count, missing }) {
+    const row = this.el.createDiv({ cls: 'lc-folder-row' + (missing ? ' lc-folder-missing' : '') });
+    row.style.paddingLeft = `${6 + depth * 18}px`;
+    const caret = row.createSpan({ cls: 'lc-folder-caret' });
+    const open = hasKids && this.expanded.has(path);
+    if (hasKids) {
+      caret.setText(open ? '\u25BE' : '\u25B8');
+      caret.addClass('lc-folder-caret-active');
+      caret.addEventListener('click', () => {
+        if (open) this.expanded.delete(path); else this.expanded.add(path);
+        this.render();
+      });
+    }
+    const labelEl = row.createEl('label', { cls: 'lc-folder-label' });
+    const box = labelEl.createEl('input', { attr: { type: 'checkbox' } });
+    const by = this.coveredBy(path);
+    box.checked = !!by;
+    if (by && by !== path) {
+      box.disabled = true;
+      labelEl.setAttr('title', by === '/' ? 'Included: Entire vault is ticked' : `Included through \u201C${by}\u201D`);
+    }
+    box.addEventListener('change', () => this.toggle(path, box.checked));
+    labelEl.createSpan({ cls: 'lc-folder-name', text: label });
+    if (missing) labelEl.createSpan({ cls: 'lc-folder-note', text: 'not found' });
+    if (path === this.suggested) labelEl.createSpan({ cls: 'lc-folder-tag', text: 'open note' });
+    if (count != null) row.createSpan({ cls: 'lc-folder-count', text: String(count) });
+    return open;
+  }
+}
+
+// Pop-up asking which folders to index, for when nothing is picked: opened
+// automatically on the very first launch, and by the Paused button, the
+// panel's "Choose folders" button or the command. Ticks are a draft until
+// "Start indexing"; closing it any other way changes nothing.
+class FolderPromptModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.draft = (TUNABLES.INCLUDED_FOLDERS || []).slice();
+    this.confirmed = false;
+    // Suggest the folder of the note that's open, pre-ticked. Not for a note
+    // at the vault root: the only folder covering it is the entire vault.
+    this.suggested = null;
+    const active = app.workspace.getActiveFile();
+    const parent = active && active.parent;
+    if (this.draft.length === 0 && parent && parent.path && parent.path !== '/'
+        && app.vault.getAbstractFileByPath(parent.path) instanceof TFolder) {
+      this.suggested = parent.path;
+      this.draft = [parent.path];
+    }
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('lc-folder-modal');
+    if (this.titleEl) this.titleEl.setText('Choose folders to index');
+    contentEl.createEl('p', {
+      cls: 'lc-folder-modal-text',
+      text: 'Local Connections only looks at the folders you tick here. Subfolders are included. '
+        + 'You can change this any time in the plugin\u2019s settings.',
+    });
+    if (this.suggested) {
+      contentEl.createEl('p', {
+        cls: 'lc-folder-modal-text',
+        text: `\u201C${this.suggested}\u201D is ticked because the note you have open is in it.`,
+      });
+    }
+
+    const treeEl = contentEl.createDiv();
+    const footer = contentEl.createDiv({ cls: 'lc-folder-modal-footer' });
+    const status = footer.createSpan({ cls: 'lc-folder-modal-status' });
+    const later = footer.createEl('button', { text: 'Not now' });
+    const start = footer.createEl('button', { cls: 'mod-cta', text: 'Start indexing' });
+
+    const update = () => {
+      const n = this.draft.length;
+      start.disabled = n === 0;
+      status.setText(n === 0 ? 'Tick at least one folder.' : FolderTree.summary(this.draft));
+    };
+    const tree = new FolderTree(this.app, treeEl, {
+      expanded: FolderTree.expandedFor(this.draft),
+      suggested: this.suggested,
+      getSelected: () => this.draft,
+      onChange: (next) => { this.draft = next; tree.render(); update(); },
+    });
+    tree.render();
+    update();
+
+    later.addEventListener('click', () => this.close());
+    start.addEventListener('click', () => this.confirm());
+  }
+
+  async confirm() {
+    if (this.confirmed || this.draft.length === 0) return;
+    this.confirmed = true;
+    const item = SETTINGS_ITEMS.find((i) => i.key === 'INCLUDED_FOLDERS');
+    TUNABLES.INCLUDED_FOLDERS = coerceSetting(item, this.draft, []);
+    this.close();
+    try { await this.plugin.saveSettings(); } catch (e) { /* still index; it'll save next time */ }
+    // "Start indexing" means go: if the plugin was paused, resume (which runs
+    // the owed vault pass); otherwise just start the pass.
+    if (this.plugin.paused) {
+      this.plugin.vaultScanOwed = true;
+      await this.plugin.togglePause();
+    } else {
+      this.plugin.requestVaultScan();
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    if (this.plugin.folderModal === this) this.plugin.folderModal = null;
+    this.plugin.refreshView();
+  }
+}
+
 class LocalConnectionsSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -2489,12 +2765,10 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
   buildReset(parent) {
     new Setting(parent)
       .setName('Reset all settings')
-      .setDesc('Back to the defaults. Your index is kept.')
+      .setDesc('Back to the defaults. Your folders and index are kept.')
       .addButton((b) => b.setButtonText('Reset').setWarning().onClick(async () => {
-        const before = JSON.stringify(TUNABLES.INCLUDED_FOLDERS);
         await this.plugin.resetSettings();
         this.plugin.refreshView();
-        if (JSON.stringify(TUNABLES.INCLUDED_FOLDERS) !== before) this.scheduleRescan(0);
         this.display(); // re-render so the controls show the defaults
         new Notice('Local Connections: settings reset to defaults.');
       }));
@@ -2547,123 +2821,33 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
   }
 
   // ----- folder picker -----
-  // A button that opens a tree of every folder in the vault, one checkbox
-  // each. Ticking a folder includes everything below it, so its subfolders
-  // show as ticked and locked. "Entire vault" (stored as "/") covers all of it,
-  // notes at the vault root included.
+  // A button that opens the folder tree right below the setting. Ticks save
+  // immediately; indexing waits until the clicking stops (scheduleRescan).
   buildFolderPicker(containerEl, item) {
     const s = new Setting(containerEl).setName(item.name).setDesc(this.descFor(item));
     if (s.settingEl) s.settingEl.addClass('lc-setting-folders');
     let button = null;
-    s.addButton((b) => { button = b; b.onClick(() => {
-      this.folderTreeOpen = !this.folderTreeOpen;
-      render();
-    }); });
-    const panel = containerEl.createDiv({ cls: 'lc-folder-tree' });
-
-    const vault = this.app.vault;
-    // Notes per folder, counting everything below it.
-    const counts = new Map();
-    for (const f of vault.getMarkdownFiles()) {
-      for (let dir = f.parent; dir; dir = dir.parent) counts.set(dir.path, (counts.get(dir.path) || 0) + 1);
-    }
-    const subfolders = (folder) => (folder.children || [])
-      .filter((c) => c instanceof TFolder)
-      .sort((x, y) => x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: 'base' }));
-
-    const selected = () => TUNABLES.INCLUDED_FOLDERS;
-    // The ticked folder that covers `path` (itself or an ancestor), if any.
-    const coveredBy = (path) => {
-      const sel = selected();
-      if (sel.includes('/')) return '/';
-      for (const f of sel) if (path === f || path.startsWith(f + '/')) return f;
-      return null;
-    };
-
-    // Open the branches leading to ticked folders the first time, so you can
-    // see your selection without digging for it.
-    if (!this.folderExpanded) {
-      this.folderExpanded = new Set();
-      for (const f of selected()) {
-        const parts = f.split('/');
-        for (let i = 1; i < parts.length; i++) this.folderExpanded.add(parts.slice(0, i).join('/'));
-      }
-    }
-
-    const setSelected = (path, on) => {
-      let next = selected().filter((f) => f !== path);
-      if (on) {
-        // Ticking a folder makes ticks below it redundant; "/" replaces all.
-        next = path === '/' ? [] : next.filter((f) => !f.startsWith(path + '/'));
-        next.push(path);
-      }
-      TUNABLES.INCLUDED_FOLDERS = coerceSetting(item, next, TUNABLE_DEFAULTS[item.key]);
-      this.applyDebounced();     // save + refresh the panel
-      this.scheduleRescan(1500); // index / prune once the clicking stops
-      render();
-    };
-
-    const summary = () => {
-      const sel = selected();
-      if (sel.length === 0) return 'Choose folders';
-      if (sel.includes('/')) return 'Entire vault';
-      if (sel.length === 1) return sel[0].split('/').pop();
-      return `${sel.length} folders`;
-    };
-
-    const addRow = (parentEl, { path, label, depth, hasKids, count, missing }) => {
-      const row = parentEl.createDiv({ cls: 'lc-folder-row' + (missing ? ' lc-folder-missing' : '') });
-      row.style.paddingLeft = `${6 + depth * 18}px`;
-      const caret = row.createSpan({ cls: 'lc-folder-caret' });
-      const open = this.folderExpanded.has(path);
-      if (hasKids) {
-        caret.setText(open ? '▾' : '▸');
-        caret.addClass('lc-folder-caret-active');
-        caret.addEventListener('click', () => {
-          if (open) this.folderExpanded.delete(path); else this.folderExpanded.add(path);
-          render();
-        });
-      }
-      const labelEl = row.createEl('label', { cls: 'lc-folder-label' });
-      const box = labelEl.createEl('input', { attr: { type: 'checkbox' } });
-      const by = coveredBy(path);
-      box.checked = !!by;
-      if (by && by !== path) {
-        box.disabled = true;
-        labelEl.setAttr('title', by === '/' ? 'Included: entire vault is ticked' : `Included through “${by}”`);
-      }
-      box.addEventListener('change', () => setSelected(path, box.checked));
-      labelEl.createSpan({ cls: 'lc-folder-name', text: label });
-      if (missing) labelEl.createSpan({ cls: 'lc-folder-note', text: 'not found' });
-      if (count != null) row.createSpan({ cls: 'lc-folder-count', text: String(count) });
-      return open;
-    };
-
-    const addFolder = (parentEl, folder, depth) => {
-      const kids = subfolders(folder);
-      const open = addRow(parentEl, {
-        path: folder.path, label: folder.name, depth, hasKids: kids.length > 0,
-        count: counts.get(folder.path) || 0,
-      });
-      if (open) for (const k of kids) addFolder(parentEl, k, depth + 1);
-    };
-
+    s.addButton((b) => {
+      button = b;
+      b.onClick(() => { this.folderTreeOpen = !this.folderTreeOpen; render(); });
+    });
+    const panel = containerEl.createDiv();
+    if (!this.folderExpanded) this.folderExpanded = FolderTree.expandedFor(TUNABLES.INCLUDED_FOLDERS);
+    const tree = new FolderTree(this.app, panel, {
+      expanded: this.folderExpanded,
+      getSelected: () => TUNABLES.INCLUDED_FOLDERS,
+      onChange: (next) => {
+        TUNABLES.INCLUDED_FOLDERS = coerceSetting(item, next, []);
+        this.applyDebounced();     // save + refresh the panel
+        this.scheduleRescan(1500); // index / prune once the clicking stops
+        render();
+      },
+    });
     const render = () => {
       const open = !!this.folderTreeOpen;
-      if (button) button.setButtonText(`${summary()} ${open ? '▴' : '▾'}`);
+      if (button) button.setButtonText(`${FolderTree.summary(TUNABLES.INCLUDED_FOLDERS)} ${open ? '\u25B4' : '\u25BE'}`);
       panel.toggleClass('lc-hidden', !open);
-      panel.empty();
-      if (!open) return;
-
-      // Ticked folders that no longer exist (deleted, or renamed outside
-      // Obsidian): listed first so they can be unticked.
-      for (const f of selected()) {
-        if (f === '/' || vault.getAbstractFileByPath(f) instanceof TFolder) continue;
-        addRow(panel, { path: f, label: f, depth: 0, hasKids: false, count: null, missing: true });
-      }
-      const root = vault.getRoot();
-      addRow(panel, { path: '/', label: 'Entire vault', depth: 0, hasKids: false, count: counts.get(root.path) || 0 });
-      for (const k of subfolders(root)) addFolder(panel, k, 0);
+      if (open) tree.render(); else panel.empty();
     };
     render();
   }
@@ -2745,8 +2929,7 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
       .setName('Re-embed entire vault')
       .setDesc('Rebuild the index from scratch. Only needed after changing the model or a length rule (marked \u27F3).')
       .addButton((b) => b.setButtonText('Re-embed').onClick(() => {
-        this.plugin.embedVault(true);
-        new Notice('Local Connections: re-embedding the vault.');
+        if (this.plugin.reembedAll()) new Notice('Local Connections: re-embedding the vault.');
       }));
   }
 }

@@ -33,10 +33,12 @@ Also in the panel:
 
 2. Download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/alt-n1tro/local-connections/releases/latest) and put them in `<your vault>/.obsidian/plugins/local-connections/`.
 3. In Obsidian, go to **Settings → Community plugins** and turn on Local Connections.
-4. In the plugin's settings, open **Folders** and tick the folders you want indexed.
+4. It asks which folders to index, with the folder of the note you have open already ticked. Pick what you want and click **Start indexing**.
 5. Open the panel with the ribbon icon or the command palette.
 
 The first run indexes everything in those folders, which can take a while on a big vault. After that, only notes you change are re-indexed.
+
+If you skip step 4, nothing is indexed and the panel stays paused. Click **Paused** (or **Choose folders**) to pick folders later.
 
 ## Settings
 
