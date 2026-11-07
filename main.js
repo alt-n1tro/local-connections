@@ -1,6 +1,6 @@
 'use strict';
 
-const { Plugin, ItemView, PluginSettingTab, Setting, Notice, TFile, Modal, debounce } = require('obsidian');
+const { Plugin, ItemView, PluginSettingTab, Setting, Notice, TFile, TFolder, Modal, debounce } = require('obsidian');
 
 /* ============================================================================
  *  TUNABLES  —  edit these freely, then reload the plugin (or restart Obsidian)
@@ -133,9 +133,10 @@ const TUNABLES = {
   // else is skipped. Whether a note gets a whole-note vector is decided purely
   // by length (NOTE_EMBED_MAX_CHARS), not by folder — long docs (e.g. YouTube
   // transcripts) get block vectors only, with noteVec stored as null.
-  INCLUDED_FOLDERS: [
-    '5 - Permanent Notes',
-  ],
+  // "/" means the entire vault. Empty = nothing chosen yet: indexing doesn't
+  // run at all (and nothing is pruned) until folders are picked, and the user
+  // is asked to pick some. Pick folders in the settings tab's folder tree.
+  INCLUDED_FOLDERS: [],
 
   // --- performance ---
   SAVE_EVERY_N: 10,         // flush vectors.json to disk every N notes during a full embed
@@ -159,144 +160,162 @@ const TUNABLE_DEFAULTS = JSON.parse(JSON.stringify(TUNABLES));
  *  re-embed (the tab shows a reminder and a Re-embed button).
  * ==========================================================================*/
 const SETTINGS_SCHEMA = [
+  // ---------- basic: always visible ----------
   {
-    name: 'Connection',
-    desc: 'Where the local embedding model lives.',
+    name: 'Ollama',
     items: [
-      { key: 'OLLAMA_HOST', name: 'Ollama host', type: 'text',
-        desc: 'URL of your local Ollama server.\nExample: http://localhost:11434' },
+      { key: 'OLLAMA_HOST', name: 'Ollama address', type: 'text',
+        desc: 'Where your Ollama server runs.\nDefault: http://localhost:11434' },
       { key: 'MODEL', name: 'Embedding model', type: 'text', reembed: true,
-        desc: 'The Ollama model used for embeddings — it must be pulled first (ollama pull <model>). Changing this invalidates the whole cache.\nExample: bge-m3:latest' },
-      { key: 'EXPECTED_DIM', name: 'Embedding dimension', type: 'int', min: 0, reembed: true,
-        desc: 'The vector width the model outputs (bge-m3 = 1024). Vectors of any other length can’t be compared, so those notes silently never match — change this ONLY if you switch to a model with a different dimension. 0 turns the safety check off.\nDefault: 1024' },
+        desc: 'Must be downloaded in Ollama first (ollama pull <model>).\nDefault: bge-m3:latest' },
     ],
   },
   {
-    name: 'What gets embedded',
-    desc: 'Which notes are indexed, and the length rules that decide what counts. Folder changes apply automatically; the length rules need a re-embed.',
+    name: 'What to index',
+    reembedButton: true,
     items: [
-      { key: 'INCLUDED_FOLDERS', name: 'Included folders', type: 'folders',
-        desc: 'One folder path per line. ONLY notes under these folders are indexed; everything else is ignored. Applies when you click away from the box.\nExample:\n5 - Permanent Notes\n10 - News Articles' },
-      { key: 'MIN_NOTE_CHARS', name: 'Minimum note length', type: 'int', min: 0, reembed: true,
-        desc: 'Notes shorter than this many characters (after cleaning) are skipped entirely.\nDefault: 100' },
-      { key: 'MIN_BLOCK_CHARS', name: 'Minimum block length', type: 'int', min: 0, reembed: true,
-        desc: 'Paragraphs shorter than this are dropped, so headers and one-word lines don’t become blocks.\nDefault: 40' },
-      { key: 'NOTE_EMBED_MAX_CHARS', name: 'Whole-note size cap', type: 'int', min: 1000, reembed: true,
-        desc: 'A note longer than this (~28k chars ≈ the model’s 8192-token limit) is embedded at the block level only — its whole-note vector is skipped rather than silently truncated. Long transcripts fall here.\nDefault: 28000' },
+      { key: 'INCLUDED_FOLDERS', name: 'Folders', type: 'folders',
+        desc: 'Only notes inside the ticked folders are indexed. Subfolders come along automatically.' },
     ],
   },
   {
-    name: 'Results & display',
-    desc: 'How many results show, and how they look.',
+    name: 'Results',
     items: [
-      { key: 'NOTE_RESULT_LIMIT', name: 'Max similar notes', type: 'int', min: 1,
-        desc: 'How many rows the Notes tab shows.\nDefault: 25' },
-      { key: 'BLOCK_RESULT_LIMIT', name: 'Max similar blocks', type: 'int', min: 1,
-        desc: 'How many rows the Blocks tab shows.\nDefault: 25' },
-      { key: 'DEFAULT_TAB', name: 'Default tab', type: 'select', options: { notes: 'Notes', blocks: 'Blocks' },
-        desc: 'Which tab is active when the panel first opens.\nDefault: Notes' },
-      { key: 'EXCLUDE_LINKED_NOTES', name: 'Hide already-linked notes', type: 'toggle',
-        desc: 'When on, notes you already link to from the current note are hidden from the results — you’ve handled those.\nDefault: on' },
-      { key: 'SHOW_CURRENT_BLOCK', name: 'Show which block matched', type: 'toggle',
-        desc: 'In the Blocks tab, also show which paragraph of YOUR note the match was closest to.\nDefault: on' },
-      { key: 'BLOCK_PREVIEW_CHARS', name: 'Block preview length', type: 'int', min: 40,
-        desc: 'How much of a matching paragraph to show before you click to expand it.\nDefault: 220' },
-      { key: 'BLOCK_EXPANDED_MAX_CHARS', name: 'Block expanded length', type: 'int', min: 100,
-        desc: 'The cap when you click a block to expand it (~150 words). Past this, open the note instead.\nDefault: 800' },
-      { key: 'DISPLAY_SCORE', name: 'Score shown', type: 'select', options: { raw: 'Raw cosine', scaled: 'Power-scaled' },
-        desc: 'Whether each row shows the true cosine similarity or the power-scaled value. Sorting always uses the scaled value.\nDefault: Raw cosine' },
-      { key: 'SCORE_DECIMALS', name: 'Score decimals', type: 'int', min: 0, max: 6,
-        desc: 'Decimal places shown on scores.\nDefault: 3' },
-    ],
-  },
-  {
-    name: 'Ranking',
-    desc: 'How matches are scored and filtered.',
-    items: [
-      { key: 'BETA', name: 'Power scaling (BETA)', type: 'slider', min: 1, max: 5, step: 0.5,
-        desc: 'bge-m3 scores bunch up in a narrow high band; raising this spreads the top results apart so the best matches stand out. 1 = off (raw cosine). It doesn’t reorder — it reshapes the spread.\nDefault: 3' },
-      { key: 'NOTE_MIN_SCALED_SCORE', name: 'Notes: hide weak matches below', type: 'slider', min: 0, max: 1, step: 0.02,
-        desc: 'Hide similar-note results whose (scaled) score is below this. 0 = show everything up to the limit.\nDefault: 0' },
-      { key: 'BLOCK_MIN_SCALED_SCORE', name: 'Blocks: hide weak matches below', type: 'slider', min: 0, max: 1, step: 0.02,
-        desc: 'Same, for the Blocks tab. 0 = show everything.\nDefault: 0' },
-    ],
-  },
-  {
-    name: 'Similar-blocks gate',
-    desc: 'Blocks are ranked by their raw similarity. Short paragraphs — the false-positive risk — are additionally weighted by how related the two notes are, so a tiny generic passage matching between unrelated notes gets demoted.',
-    items: [
-      { key: 'BLOCK_GATE_ENABLED', name: 'Consensus gate (short blocks)', type: 'toggle',
-        desc: 'For SHORT block matches only (see the length below), rank by (block similarity × whole-note similarity) instead of raw similarity — pushing a short passage that matches between two unrelated notes down the list. Long paragraphs are always ranked raw.\nDefault: on' },
-      { key: 'BLOCK_GATE_MAX_CHARS', name: 'Gate length threshold', type: 'int', min: 0,
-        desc: 'Only block matches whose suggested paragraph is at/below this many characters get gated; longer ones are ranked purely by raw similarity.\nDefault: 85' },
-      { key: 'BLOCK_GATE_FLOOR', name: 'Gate floor', type: 'slider', min: 0, max: 0.9, step: 0.05,
-        desc: 'For gated (short) blocks only: hide one entirely when the two notes’ whole-note similarity is at/below this. 0 = never hide, only demote — recommended, so cross-domain matches stay visible.\nDefault: 0' },
-    ],
-  },
-  {
-    name: 'Strange pairs',
-    desc: 'Notes that agree in substance but not in framing — the cross-domain connection seed. Its tab only appears when there’s at least one.',
-    items: [
-      { key: 'STRANGE_MIN_BODY', name: 'Min body agreement', type: 'slider', min: 0, max: 1, step: 0.02,
-        desc: 'Two notes’ bodies must be at least this similar to count as a pair.\nDefault: 0.6' },
-      { key: 'STRANGE_MIN_DELTA', name: 'Min framing gap', type: 'slider', min: 0, max: 0.5, step: 0.02,
-        desc: '…and their bodies must agree this much MORE than their titles do. Higher = only “same idea, very different framing” pairs.\nDefault: 0.15' },
-      { key: 'STRANGE_RESULT_LIMIT', name: 'Max pairs', type: 'int', min: 1,
-        desc: 'How many pairs to show.\nDefault: 15' },
+      { key: 'NOTE_RESULT_LIMIT', name: 'Notes to show', type: 'int', min: 1,
+        desc: 'Rows in the Notes tab.\nDefault: 25' },
+      { key: 'BLOCK_RESULT_LIMIT', name: 'Blocks to show', type: 'int', min: 1,
+        desc: 'Rows in the Blocks tab.\nDefault: 25' },
+      { key: 'EXCLUDE_LINKED_NOTES', name: 'Hide notes you already link to', type: 'toggle',
+        desc: 'You’ve already made those connections.\nDefault: on' },
+      { key: 'DEFAULT_TAB', name: 'Open on', type: 'select', options: { notes: 'Notes', blocks: 'Blocks' },
+        desc: 'Which tab the panel shows first.\nDefault: Notes' },
     ],
   },
   {
     name: 'Strong-match markers',
-    desc: 'A small superscript on each tab (Blocks³) counting how many of its results score at or above these, so a strong match doesn’t go unnoticed in a tab you aren’t looking at. Counts only the rows the tab actually shows. Set a slider to 1 to effectively turn that marker off.',
+    desc: 'The small number on a tab (Blocks³) counts results at or above these scores, so you notice strong matches in tabs you aren’t looking at. Set to 1 to turn one off.',
     items: [
-      { key: 'STRONG_NOTE_MIN', name: 'Notes: strong match at', type: 'slider', min: 0.5, max: 1, step: 0.01,
-        desc: 'A Notes-tab row counts once its displayed score reaches this.\nDefault: 0.8' },
-      { key: 'STRONG_BLOCK_MIN', name: 'Blocks: strong match at', type: 'slider', min: 0.5, max: 1, step: 0.01,
-        desc: 'A Blocks-tab row counts once its displayed score reaches this.\nDefault: 0.8' },
-      { key: 'STRONG_PAIR_MIN', name: 'Pairs: strong match at', type: 'slider', min: 0.5, max: 1, step: 0.01,
-        desc: 'A pair counts once its body agreement (the “body” number on its sub-line) reaches this.\nDefault: 0.7' },
+      { key: 'STRONG_NOTE_MIN', name: 'Notes', type: 'slider', min: 0.5, max: 1, step: 0.01,
+        desc: 'Default: 0.80' },
+      { key: 'STRONG_BLOCK_MIN', name: 'Blocks', type: 'slider', min: 0.5, max: 1, step: 0.01,
+        desc: 'Default: 0.80' },
+      { key: 'STRONG_PAIR_MIN', name: 'Pairs', type: 'slider', min: 0.5, max: 1, step: 0.01,
+        desc: 'Compared against the body score.\nDefault: 0.70' },
+    ],
+  },
+
+  // ---------- advanced: folded away under "Advanced settings" ----------
+  {
+    name: 'Indexing',
+    advanced: true,
+    reembedButton: true,
+    desc: 'Length rules for what counts as a note or a paragraph. Changes here need a re-embed.',
+    items: [
+      { key: 'MIN_NOTE_CHARS', name: 'Minimum note length', type: 'int', min: 0, reembed: true,
+        desc: 'Notes shorter than this many characters are skipped.\nDefault: 100' },
+      { key: 'MIN_BLOCK_CHARS', name: 'Minimum paragraph length', type: 'int', min: 0, reembed: true,
+        desc: 'Shorter paragraphs (headings, one-liners) aren’t indexed as blocks.\nDefault: 40' },
+      { key: 'NOTE_EMBED_MAX_CHARS', name: 'Whole-note size cap', type: 'int', min: 1000, reembed: true,
+        desc: 'Longer notes (e.g. transcripts) are indexed by paragraph only, since the model can’t read that much at once.\nDefault: 28000' },
+      { key: 'EXPECTED_DIM', name: 'Embedding dimension', type: 'int', min: 0, reembed: true,
+        desc: 'Vector size the model produces (bge-m3: 1024). Only change this with a different model. 0 turns the check off.\nDefault: 1024' },
+    ],
+  },
+  {
+    name: 'Scoring',
+    advanced: true,
+    items: [
+      { key: 'BETA', name: 'Power scaling', type: 'slider', min: 1, max: 5, step: 0.5,
+        desc: 'Spreads out scores that bunch together so the best matches stand out. Doesn’t change the order. 1 = off.\nDefault: 3' },
+      { key: 'NOTE_MIN_SCALED_SCORE', name: 'Notes: hide matches below', type: 'slider', min: 0, max: 1, step: 0.02,
+        desc: 'Compared against the scaled score. 0 = show everything.\nDefault: 0' },
+      { key: 'BLOCK_MIN_SCALED_SCORE', name: 'Blocks: hide matches below', type: 'slider', min: 0, max: 1, step: 0.02,
+        desc: 'Same for the Blocks tab.\nDefault: 0' },
+      { key: 'DISPLAY_SCORE', name: 'Score shown', type: 'select', options: { raw: 'Raw cosine', scaled: 'Power-scaled' },
+        desc: 'Which number each row displays. Sorting always uses the scaled one.\nDefault: Raw cosine' },
+      { key: 'SCORE_DECIMALS', name: 'Score decimals', type: 'int', min: 0, max: 6,
+        desc: 'Default: 3' },
+    ],
+  },
+  {
+    name: 'Short-paragraph filter',
+    advanced: true,
+    desc: 'A short paragraph can match by accident between two unrelated notes. These settings push such matches down the Blocks list.',
+    items: [
+      { key: 'BLOCK_GATE_ENABLED', name: 'Enabled', type: 'toggle',
+        desc: 'Short matches are weighted by how related the two whole notes are. Long paragraphs are never affected.\nDefault: on' },
+      { key: 'BLOCK_GATE_MAX_CHARS', name: 'Counts as short up to', type: 'int', min: 0,
+        desc: 'Characters.\nDefault: 85' },
+      { key: 'BLOCK_GATE_FLOOR', name: 'Hide below', type: 'slider', min: 0, max: 0.9, step: 0.05,
+        desc: 'Hide a short match entirely when the two notes are less related than this. 0 = never hide, only push down.\nDefault: 0' },
+    ],
+  },
+  {
+    name: 'Pairs',
+    advanced: true,
+    desc: 'Notes whose content agrees while their titles don’t.',
+    items: [
+      { key: 'STRANGE_MIN_BODY', name: 'Minimum body score', type: 'slider', min: 0, max: 1, step: 0.02,
+        desc: 'Default: 0.6' },
+      { key: 'STRANGE_MIN_DELTA', name: 'Minimum difference', type: 'slider', min: 0, max: 0.5, step: 0.02,
+        desc: 'How much more the bodies must agree than the titles.\nDefault: 0.15' },
+      { key: 'STRANGE_RESULT_LIMIT', name: 'Pairs to show', type: 'int', min: 1,
+        desc: 'Default: 15' },
     ],
   },
   {
     name: 'Gravity',
-    desc: 'Notes your recent thinking keeps circling, surfaced at the top of the Notes tab.',
+    advanced: true,
+    desc: 'Notes your recent writing keeps returning to, shown at the top of the Notes tab.',
     items: [
-      { key: 'GRAVITY_ENABLED', name: 'Enable gravity', type: 'toggle',
-        desc: 'Turn the Gravity section on or off.\nDefault: on' },
+      { key: 'GRAVITY_ENABLED', name: 'Enabled', type: 'toggle',
+        desc: 'Default: on' },
       { key: 'GRAVITY_RECENT_N', name: 'Recent notes considered', type: 'int', min: 3,
-        desc: 'How many of your most recently edited notes count as “recent thinking”.\nDefault: 30' },
+        desc: 'Default: 30' },
       { key: 'GRAVITY_TOP_K', name: 'Neighbours per note', type: 'int', min: 1,
-        desc: 'How many nearest neighbours of each recent note to look at.\nDefault: 8' },
+        desc: 'Default: 8' },
       { key: 'GRAVITY_MIN_SIM', name: 'Neighbour threshold', type: 'slider', min: 0, max: 1, step: 0.02,
-        desc: 'A note only counts as a neighbour above this similarity.\nDefault: 0.45' },
-      { key: 'GRAVITY_MIN_COUNT', name: 'Min recurrences', type: 'int', min: 1,
-        desc: 'A note must appear in at least this many recent neighbourhoods to be an attractor.\nDefault: 2' },
-      { key: 'GRAVITY_MAX_SHOW', name: 'Max shown', type: 'int', min: 1,
-        desc: 'How many attractors to show at the top.\nDefault: 2' },
+        desc: 'Default: 0.45' },
+      { key: 'GRAVITY_MIN_COUNT', name: 'Minimum recurrences', type: 'int', min: 1,
+        desc: 'Default: 2' },
+      { key: 'GRAVITY_MAX_SHOW', name: 'Notes to show', type: 'int', min: 1,
+        desc: 'Default: 2' },
     ],
   },
   {
-    name: 'Advanced',
-    desc: 'Performance and internals — most people never need to touch these.',
+    name: 'Display',
+    advanced: true,
     items: [
-      { key: 'BATCH_SIZE', name: 'Embedding batch size', type: 'int', min: 1,
-        desc: 'How many texts are sent to Ollama per request.\nDefault: 50' },
+      { key: 'SHOW_CURRENT_BLOCK', name: 'Show which of your paragraphs matched', type: 'toggle',
+        desc: 'In the Blocks tab.\nDefault: on' },
+      { key: 'BLOCK_PREVIEW_CHARS', name: 'Paragraph preview length', type: 'int', min: 40,
+        desc: 'Default: 220' },
+      { key: 'BLOCK_EXPANDED_MAX_CHARS', name: 'Expanded paragraph length', type: 'int', min: 100,
+        desc: 'Default: 800' },
+      { key: 'NOTE_TITLE_MAX_CHARS', name: 'Note title length (Notes tab)', type: 'int', min: 20,
+        desc: 'Default: 140' },
+      { key: 'BLOCK_TITLE_MAX_CHARS', name: 'Note title length (Blocks and Pairs tabs)', type: 'int', min: 20,
+        desc: 'Default: 140' },
+      { key: 'NOTE_EXPANDED_MAX_CHARS', name: 'Note preview length', type: 'int', min: 50,
+        desc: 'When you expand a row.\nDefault: 600' },
+      { key: 'DRIFT_BLOCK_PREVIEW_CHARS', name: 'Drift window preview length', type: 'int', min: 40,
+        desc: 'Default: 160' },
+    ],
+  },
+  {
+    name: 'Performance',
+    advanced: true,
+    items: [
+      { key: 'BATCH_SIZE', name: 'Batch size', type: 'int', min: 1,
+        desc: 'Texts sent to Ollama per request.\nDefault: 50' },
       { key: 'REQUEST_TIMEOUT_MS', name: 'Request timeout (ms)', type: 'int', min: 1000,
-        desc: 'Abort an Ollama request that hasn’t responded in this long, so a hung server can’t freeze indexing.\nDefault: 120000' },
+        desc: 'Give up on a request after this long, so a stuck server can’t freeze indexing.\nDefault: 120000' },
       { key: 'SAVE_EVERY_N', name: 'Save every N notes', type: 'int', min: 1,
-        desc: 'Flush the vector cache to disk every N notes during a long embed, so a crash loses at most this many.\nDefault: 10' },
-      { key: 'SWITCH_DEBOUNCE_MS', name: 'Note-switch debounce (ms)', type: 'int', min: 0,
-        desc: 'Delay before recomputing results after you switch notes.\nDefault: 150' },
-      { key: 'MODIFY_DEBOUNCE_MS', name: 'Edit debounce (ms)', type: 'int', min: 0,
-        desc: 'Delay before re-embedding a note after you stop editing it.\nDefault: 800' },
-      { key: 'NOTE_TITLE_MAX_CHARS', name: 'Note title cap', type: 'int', min: 20,
-        desc: 'Max characters of a note title shown in a Notes-tab row.\nDefault: 140' },
-      { key: 'BLOCK_TITLE_MAX_CHARS', name: 'Block title cap', type: 'int', min: 20,
-        desc: 'Max characters of a note title shown on each Blocks-tab and Pairs-tab row.\nDefault: 140' },
-      { key: 'NOTE_EXPANDED_MAX_CHARS', name: 'Note body preview cap', type: 'int', min: 50,
-        desc: 'Max characters of body shown in an expanded note dropdown.\nDefault: 600' },
-      { key: 'DRIFT_BLOCK_PREVIEW_CHARS', name: 'Drift block preview cap', type: 'int', min: 40,
-        desc: 'Max characters of each block shown in the Drift window.\nDefault: 160' },
+        desc: 'During a long index run.\nDefault: 10' },
+      { key: 'SWITCH_DEBOUNCE_MS', name: 'Note-switch delay (ms)', type: 'int', min: 0,
+        desc: 'Default: 150' },
+      { key: 'MODIFY_DEBOUNCE_MS', name: 'Edit delay (ms)', type: 'int', min: 0,
+        desc: 'Wait this long after you stop typing before re-indexing a note.\nDefault: 800' },
     ],
   },
 ];
@@ -318,9 +337,16 @@ function coerceSetting(item, raw, fallback) {
       // Strip surrounding slashes: isExcluded() matches on `folder + '/'`, so a
       // pasted "5 - Permanent Notes/" would otherwise never match anything and
       // silently index nothing.
-      const clean = (list) => list
-        .map((s) => String(s).trim().replace(/^\/+|\/+$/g, ''))
-        .filter(Boolean);
+      // A lone "/" means the whole vault and is kept as-is.
+      const clean = (list) => {
+        const out = [];
+        for (const raw of list) {
+          const t = String(raw).trim();
+          const f = t === '/' ? '/' : t.replace(/^\/+|\/+$/g, '');
+          if (f && !out.includes(f)) out.push(f);
+        }
+        return out;
+      };
       if (Array.isArray(raw)) return clean(raw);
       if (typeof raw === 'string') return clean(raw.split('\n'));
       return Array.isArray(fallback) ? fallback.slice() : [];
@@ -516,7 +542,12 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     this.addCommand({
       id: 'reembed-all',
       name: 'Re-embed entire vault',
-      callback: () => this.embedVault(true),
+      callback: () => this.reembedAll(),
+    });
+    this.addCommand({
+      id: 'choose-folders',
+      name: 'Choose folders to index',
+      callback: () => this.openFolderPrompt(),
     });
     this.addCommand({
       id: 'toggle-pause-embedding',
@@ -569,6 +600,17 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     );
 
     this.app.workspace.onLayoutReady(() => {
+      // Nothing chosen yet: stay idle (the panel shows "Paused" and a "Choose
+      // folders" button). Pop the chooser up on its own only the very first
+      // time, so dismissing it doesn't mean seeing it on every launch.
+      if (!this.hasFolders()) {
+        if (!this.folderPrompted) {
+          this.folderPrompted = true;
+          this.saveSettings();
+          this.openFolderPrompt();
+        }
+        return;
+      }
       if (!this.paused) this.embedVault(false);
       else this.vaultScanOwed = true; // run it on resume instead
     });
@@ -586,7 +628,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
           return;
         }
         const moved = this.store[oldPath];
-        if (moved) {
+        if (moved && oldPath !== file.path) {
           this.store[file.path] = moved;
           delete this.store[oldPath];
         }
@@ -595,6 +637,8 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
           this.dirtyWhilePaused.add(file.path);
         }
         if (file.extension !== 'md') { this.refreshView(); return; }
+        // Nothing picked to index: keep the (moved) entry as-is, embed nothing.
+        if (!this.hasFolders()) { this.refreshView(); return; }
 
         // Renamed out of the allowlist (moved into an excluded folder): the moved
         // entry would otherwise linger as a ghost, still showing up in results
@@ -630,6 +674,9 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   }
 
   async togglePause() {
+    // Nothing to resume into: ask for folders. "Start indexing" in the pop-up
+    // then resumes for real.
+    if (!this.hasFolders()) { this.openFolderPrompt(); return; }
     this.paused = !this.paused;
     await this.saveSettings();
     if (this.paused) {
@@ -720,6 +767,55 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
         set.add(next);
       }
     }
+    // Keep the folder allowlist pointing at the renamed folder. Without this,
+    // renaming an indexed folder silently un-indexed it: the next vault pass
+    // pruned every note inside, and re-including it meant embedding it all again.
+    let foldersChanged = false;
+    TUNABLES.INCLUDED_FOLDERS = TUNABLES.INCLUDED_FOLDERS.map((f) => {
+      const next = f === oldDir ? newDir : rekey(f);
+      if (next) { foldersChanged = true; return next; }
+      return f;
+    });
+    if (foldersChanged) this.saveSettings();
+  }
+
+  // Ask for a vault pass after the folder allowlist changed. Never drops the
+  // request: while paused it waits for resume, and while a pass is already
+  // running it is picked up again when that pass ends (via vaultScanOwed in
+  // flushPending), so a folder ticked mid-run still gets indexed.
+  requestVaultScan() {
+    if (this.unloaded) return;
+    if (!this.hasFolders()) { this.refreshView(); return; }
+    if (this.paused || this.embedding) {
+      this.vaultScanOwed = true;
+      if (this.paused) new Notice('Local Connections: folders saved. They\u2019ll be indexed when you resume.');
+      this.refreshView();
+      return;
+    }
+    this.embedVault(false);
+  }
+
+  // Has the user picked anything to index? With nothing picked, every note is
+  // excluded, so a vault pass would prune the whole index: embedVault refuses
+  // to run, and the panel asks for folders instead.
+  hasFolders() {
+    return Array.isArray(TUNABLES.INCLUDED_FOLDERS) && TUNABLES.INCLUDED_FOLDERS.length > 0;
+  }
+
+  // The "choose folders" pop-up. At most one at a time, so the first-launch
+  // prompt, the Paused button and the panel's button can't stack copies of it.
+  openFolderPrompt() {
+    if (this.unloaded || this.folderModal) return;
+    this.folderModal = new FolderPromptModal(this.app, this);
+    this.folderModal.open();
+  }
+
+  // Re-embed everything (button and command). With no folders there's nothing
+  // to rebuild, and force-clearing the store first would just lose it.
+  reembedAll() {
+    if (!this.hasFolders()) { this.openFolderPrompt(); return false; }
+    this.embedVault(true);
+    return true;
   }
 
   // Drop every cached entry (and queued path) beneath a deleted folder.
@@ -883,11 +979,12 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       }
     }
     this.paused = !!saved.paused;
+    this.folderPrompted = !!saved.folderPrompted;
   }
 
   // The persisted shape: every schema key's current TUNABLES value, plus paused.
   collectSettings() {
-    const out = { paused: this.paused };
+    const out = { paused: this.paused, folderPrompted: !!this.folderPrompted };
     for (const item of SETTINGS_ITEMS) out[item.key] = TUNABLES[item.key];
     return out;
   }
@@ -897,8 +994,11 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   }
 
   // Restore every setting to its literal default (used by the settings tab).
+  // The folder choice is kept: it's what you index, not a tuning knob, and
+  // resetting it would leave nothing selected.
   async resetSettings() {
     for (const item of SETTINGS_ITEMS) {
+      if (item.key === 'INCLUDED_FOLDERS') continue;
       const def = TUNABLE_DEFAULTS[item.key];
       TUNABLES[item.key] = Array.isArray(def) ? def.slice() : def;
     }
@@ -1052,7 +1152,8 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
 
   isExcluded(file) {
     // Allowlist: embed ONLY notes whose path sits under one of these folders.
-    return !TUNABLES.INCLUDED_FOLDERS.some((f) => file.path.startsWith(f + '/'));
+    // "/" stands for the whole vault (including notes at the vault root).
+    return !TUNABLES.INCLUDED_FOLDERS.some((f) => f === '/' || file.path.startsWith(f + '/'));
   }
 
   // Build an onBatch(done, total) callback that surfaces per-block progress for
@@ -1284,6 +1385,10 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   async embedVault(force) {
     if (this.unloaded) return;
     if (this.embedding) return;
+    // No folders picked: every note counts as excluded, so this pass would
+    // prune (or, forced, wipe) the entire index. Do nothing; the panel shows a
+    // "Choose folders" prompt. Checked before the store is touched.
+    if (!this.hasFolders()) { this.refreshView(); return; }
     this.embedding = true;
     this.embedError = null;
     this.vaultScanOwed = false; // set again below if a pause cuts this run short
@@ -1775,15 +1880,21 @@ class ConnectionsView extends ItemView {
     const header = container.createDiv({ cls: 'lc-header' });
     this._header = header;
     const toolbar = header.createDiv({ cls: 'lc-toolbar' });
+    // With no folders picked there's nothing to run, so it reads as paused;
+    // clicking it then opens the folder pop-up (see togglePause).
+    const noFolders = !this.plugin.hasFolders();
+    const showPaused = this.plugin.paused || noFolders;
     const pauseBtn = toolbar.createEl('button', {
-      cls: 'lc-pause' + (this.plugin.paused ? ' lc-paused' : ''),
+      cls: 'lc-pause' + (showPaused ? ' lc-paused' : ''),
     });
-    pauseBtn.createSpan({ cls: 'lc-pause-label', text: this.plugin.paused ? 'Paused' : 'Live' });
+    pauseBtn.createSpan({ cls: 'lc-pause-label', text: showPaused ? 'Paused' : 'Live' });
     pauseBtn.setAttr(
       'title',
-      this.plugin.paused
-        ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
-        : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.'
+      noFolders
+        ? 'No folders chosen yet. Click to choose what to index.'
+        : this.plugin.paused
+          ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
+          : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.'
     );
     pauseBtn.addEventListener('click', () => {
       this.plugin.togglePause();
@@ -1826,6 +1937,16 @@ class ConnectionsView extends ItemView {
         cls: 'lc-empty',
         text: `Embedding error: ${this.plugin.embedError}. Check that Ollama is running and "${TUNABLES.MODEL}" is pulled.`,
       });
+      return;
+    }
+
+    // Nothing to index yet: say so, with a way to fix it, instead of a blank
+    // panel or a misleading "not embedded yet".
+    if (!this.plugin.hasFolders()) {
+      const box = scroll.createDiv({ cls: 'lc-empty lc-setup' });
+      box.createDiv({ text: 'Choose which folders to index to get started.' });
+      const choose = box.createEl('button', { cls: 'mod-cta lc-setup-btn', text: 'Choose folders' });
+      choose.addEventListener('click', () => this.plugin.openFolderPrompt());
       return;
     }
 
@@ -2387,6 +2508,213 @@ class DriftModal extends Modal {
 
 // ---------- settings ----------
 
+// ---------- folder tree (settings + pop-up) ----------
+
+// Checkbox tree of every folder in the vault, with note counts. Ticking a
+// folder includes everything below it, so its subfolders show ticked and
+// locked. "Entire vault" is stored as "/". Saves nothing itself: it reads the
+// selection from getSelected() and hands a new list to onChange().
+class FolderTree {
+  constructor(app, el, { getSelected, onChange, expanded, suggested }) {
+    this.app = app;
+    this.suggested = suggested || null;
+    this.el = el;
+    this.getSelected = getSelected;
+    this.onChange = onChange;
+    this.expanded = expanded || new Set();
+    el.addClass('lc-folder-tree');
+  }
+
+  // Open the branches leading to the ticked folders, so you can see your
+  // selection without digging for it.
+  static expandedFor(selected) {
+    const out = new Set();
+    for (const f of selected || []) {
+      const parts = f.split('/');
+      for (let i = 1; i < parts.length; i++) out.add(parts.slice(0, i).join('/'));
+    }
+    return out;
+  }
+
+  static summary(selected) {
+    if (!selected || selected.length === 0) return 'Choose folders';
+    if (selected.includes('/')) return 'Entire vault';
+    if (selected.length === 1) return selected[0].split('/').pop();
+    return `${selected.length} folders`;
+  }
+
+  // The ticked folder that covers `path` (itself or an ancestor), if any.
+  coveredBy(path) {
+    const sel = this.getSelected();
+    if (sel.includes('/')) return '/';
+    for (const f of sel) if (path === f || path.startsWith(f + '/')) return f;
+    return null;
+  }
+
+  toggle(path, on) {
+    let next = this.getSelected().filter((f) => f !== path);
+    if (on) {
+      // A tick makes ticks below it redundant; "Entire vault" replaces all.
+      next = path === '/' ? [] : next.filter((f) => !f.startsWith(path + '/'));
+      next.push(path);
+    }
+    this.onChange(next);
+  }
+
+  render() {
+    const vault = this.app.vault;
+    // Notes per folder, counting everything below it. Recounted on each render
+    // so the numbers follow notes added while the tree is open.
+    this.counts = new Map();
+    for (const f of vault.getMarkdownFiles()) {
+      for (let dir = f.parent; dir; dir = dir.parent) {
+        this.counts.set(dir.path, (this.counts.get(dir.path) || 0) + 1);
+      }
+    }
+    this.el.empty();
+    // Ticked folders that no longer exist (deleted, or renamed outside
+    // Obsidian) come first, so they can be unticked.
+    for (const f of this.getSelected()) {
+      if (f === '/' || vault.getAbstractFileByPath(f) instanceof TFolder) continue;
+      this.addRow({ path: f, label: f, depth: 0, hasKids: false, count: null, missing: true });
+    }
+    const root = vault.getRoot();
+    this.addRow({ path: '/', label: 'Entire vault', depth: 0, hasKids: false, count: this.counts.get(root.path) || 0 });
+    for (const k of this.subfolders(root)) this.addFolder(k, 0);
+  }
+
+  subfolders(folder) {
+    return (folder.children || [])
+      .filter((c) => c instanceof TFolder)
+      .sort((x, y) => x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: 'base' }));
+  }
+
+  addFolder(folder, depth) {
+    const kids = this.subfolders(folder);
+    const open = this.addRow({
+      path: folder.path, label: folder.name, depth, hasKids: kids.length > 0,
+      count: this.counts.get(folder.path) || 0,
+    });
+    if (open) for (const k of kids) this.addFolder(k, depth + 1);
+  }
+
+  addRow({ path, label, depth, hasKids, count, missing }) {
+    const row = this.el.createDiv({ cls: 'lc-folder-row' + (missing ? ' lc-folder-missing' : '') });
+    row.style.paddingLeft = `${6 + depth * 18}px`;
+    const caret = row.createSpan({ cls: 'lc-folder-caret' });
+    const open = hasKids && this.expanded.has(path);
+    if (hasKids) {
+      caret.setText(open ? '\u25BE' : '\u25B8');
+      caret.addClass('lc-folder-caret-active');
+      caret.addEventListener('click', () => {
+        if (open) this.expanded.delete(path); else this.expanded.add(path);
+        this.render();
+      });
+    }
+    const labelEl = row.createEl('label', { cls: 'lc-folder-label' });
+    const box = labelEl.createEl('input', { attr: { type: 'checkbox' } });
+    const by = this.coveredBy(path);
+    box.checked = !!by;
+    if (by && by !== path) {
+      box.disabled = true;
+      labelEl.setAttr('title', by === '/' ? 'Included: Entire vault is ticked' : `Included through \u201C${by}\u201D`);
+    }
+    box.addEventListener('change', () => this.toggle(path, box.checked));
+    labelEl.createSpan({ cls: 'lc-folder-name', text: label });
+    if (missing) labelEl.createSpan({ cls: 'lc-folder-note', text: 'not found' });
+    if (path === this.suggested) labelEl.createSpan({ cls: 'lc-folder-tag', text: 'open note' });
+    if (count != null) row.createSpan({ cls: 'lc-folder-count', text: String(count) });
+    return open;
+  }
+}
+
+// Pop-up asking which folders to index, for when nothing is picked: opened
+// automatically on the very first launch, and by the Paused button, the
+// panel's "Choose folders" button or the command. Ticks are a draft until
+// "Start indexing"; closing it any other way changes nothing.
+class FolderPromptModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.draft = (TUNABLES.INCLUDED_FOLDERS || []).slice();
+    this.confirmed = false;
+    // Suggest the folder of the note that's open, pre-ticked. Not for a note
+    // at the vault root: the only folder covering it is the entire vault.
+    this.suggested = null;
+    const active = app.workspace.getActiveFile();
+    const parent = active && active.parent;
+    if (this.draft.length === 0 && parent && parent.path && parent.path !== '/'
+        && app.vault.getAbstractFileByPath(parent.path) instanceof TFolder) {
+      this.suggested = parent.path;
+      this.draft = [parent.path];
+    }
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('lc-folder-modal');
+    if (this.titleEl) this.titleEl.setText('Choose folders to index');
+    contentEl.createEl('p', {
+      cls: 'lc-folder-modal-text',
+      text: 'Local Connections only looks at the folders you tick here. Subfolders are included. '
+        + 'You can change this any time in the plugin\u2019s settings.',
+    });
+    if (this.suggested) {
+      contentEl.createEl('p', {
+        cls: 'lc-folder-modal-text',
+        text: `\u201C${this.suggested}\u201D is ticked because the note you have open is in it.`,
+      });
+    }
+
+    const treeEl = contentEl.createDiv();
+    const footer = contentEl.createDiv({ cls: 'lc-folder-modal-footer' });
+    const status = footer.createSpan({ cls: 'lc-folder-modal-status' });
+    const later = footer.createEl('button', { text: 'Not now' });
+    const start = footer.createEl('button', { cls: 'mod-cta', text: 'Start indexing' });
+
+    const update = () => {
+      const n = this.draft.length;
+      start.disabled = n === 0;
+      status.setText(n === 0 ? 'Tick at least one folder.' : FolderTree.summary(this.draft));
+    };
+    const tree = new FolderTree(this.app, treeEl, {
+      expanded: FolderTree.expandedFor(this.draft),
+      suggested: this.suggested,
+      getSelected: () => this.draft,
+      onChange: (next) => { this.draft = next; tree.render(); update(); },
+    });
+    tree.render();
+    update();
+
+    later.addEventListener('click', () => this.close());
+    start.addEventListener('click', () => this.confirm());
+  }
+
+  async confirm() {
+    if (this.confirmed || this.draft.length === 0) return;
+    this.confirmed = true;
+    const item = SETTINGS_ITEMS.find((i) => i.key === 'INCLUDED_FOLDERS');
+    TUNABLES.INCLUDED_FOLDERS = coerceSetting(item, this.draft, []);
+    this.close();
+    try { await this.plugin.saveSettings(); } catch (e) { /* still index; it'll save next time */ }
+    // "Start indexing" means go: if the plugin was paused, resume (which runs
+    // the owed vault pass); otherwise just start the pass.
+    if (this.plugin.paused) {
+      this.plugin.vaultScanOwed = true;
+      await this.plugin.togglePause();
+    } else {
+      this.plugin.requestVaultScan();
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    if (this.plugin.folderModal === this) this.plugin.folderModal = null;
+    this.plugin.refreshView();
+  }
+}
+
 class LocalConnectionsSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -2404,65 +2732,124 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.addClass('lc-settings');
 
-    this.buildAbout(containerEl);
+    this.buildGlossary(containerEl);
 
-    for (const cat of SETTINGS_SCHEMA) {
-      new Setting(containerEl).setName(cat.name).setHeading();
-      if (cat.desc) {
-        containerEl.createEl('div', { cls: 'setting-item-description lc-cat-desc', text: cat.desc });
-      }
-      for (const item of cat.items) this.buildSetting(containerEl, item);
-      if (cat.name === 'What gets embedded') this.buildReembed(containerEl);
+    // The everyday settings are always visible; everything else folds away
+    // under "Advanced settings" so the page opens short.
+    for (const cat of SETTINGS_SCHEMA) if (!cat.advanced) this.buildCategory(containerEl, cat);
+
+    const adv = this.buildFold(containerEl, 'Advanced settings', 'advancedOpen', 'lc-advanced');
+    for (const cat of SETTINGS_SCHEMA) if (cat.advanced) this.buildCategory(adv, cat);
+    this.buildReset(adv);
+  }
+
+  // A collapsible section (<details>). Its open/closed state lives on this tab
+  // instance under `stateKey`, so re-rendering (e.g. after Reset) keeps it.
+  buildFold(parent, label, stateKey, cls) {
+    const fold = parent.createEl('details', { cls: 'lc-fold' + (cls ? ' ' + cls : '') });
+    if (this[stateKey]) fold.setAttr('open', '');
+    fold.createEl('summary', { cls: 'lc-fold-summary', text: label });
+    fold.addEventListener('toggle', () => { this[stateKey] = fold.open; });
+    return fold;
+  }
+
+  buildCategory(parent, cat) {
+    new Setting(parent).setName(cat.name).setHeading();
+    if (cat.desc) {
+      parent.createEl('div', { cls: 'setting-item-description lc-cat-desc', text: cat.desc });
     }
+    for (const item of cat.items) this.buildSetting(parent, item);
+    if (cat.reembedButton) this.buildReembed(parent);
+  }
 
-    // ---- reset ----
-    new Setting(containerEl)
-      .setName('Reset all settings to defaults')
-      .setDesc('Restore every setting above to the values it shipped with. Does not delete your embeddings.')
+  buildReset(parent) {
+    new Setting(parent)
+      .setName('Reset all settings')
+      .setDesc('Back to the defaults. Your folders and index are kept.')
       .addButton((b) => b.setButtonText('Reset').setWarning().onClick(async () => {
         await this.plugin.resetSettings();
         this.plugin.refreshView();
-        this.display(); // re-render the tab so the controls show the defaults
+        this.display(); // re-render so the controls show the defaults
         new Notice('Local Connections: settings reset to defaults.');
       }));
   }
 
-  // Build a description that renders multi-line text (examples on their own
-  // lines) and appends the ⟳ re-embed reminder for embedding-shape settings.
-  // A short "what is this / working dictionary" panel at the very top, for
-  // someone who has never seen the plugin. Kept compact on purpose.
-  buildAbout(containerEl) {
-    new Setting(containerEl).setName('About Local Connections').setHeading();
-    const box = containerEl.createEl('div', { cls: 'setting-item-description lc-about' });
+  // Short explainer, folded by default.
+  buildGlossary(containerEl) {
+    const box = this.buildFold(containerEl, 'How it works', 'glossaryOpen', 'lc-about');
 
     box.createEl('p', {
-      text: 'This plugin surfaces the notes and paragraphs most related to whatever you’re '
-        + 'reading — entirely on your own machine, using a local Ollama embedding model '
-        + '(no cloud, no subscription). It answers two questions at once: what else is in the '
-        + 'same territory as this idea (whole-note matches), and which specific paragraph '
-        + 'anywhere in your vault is precisely on-point (block matches). The goal is to help '
-        + 'you find and make the connections between your notes that you’d otherwise miss.',
+      text: 'Every note and every paragraph in the folders you pick is turned into an embedding by a '
+        + 'model running in Ollama on your computer. Notes and paragraphs with similar meaning get '
+        + 'similar embeddings, and the panel ranks them by how close they are. Nothing leaves your machine.',
     });
 
-    box.createEl('div', { cls: 'lc-about-subhead', text: 'Working dictionary' });
     const dl = box.createEl('dl', { cls: 'lc-about-dl' });
     const terms = [
-      ['Embedding', 'Turns a note or paragraph into a vector of numbers that captures its meaning. Similar meaning → vectors that point the same way. Everything here is built on this.'],
-      ['Cosine similarity', 'The score for “how alike” two things are: 1.00 = same direction, ~0 = unrelated. Every number you see in the panel is one of these.'],
-      ['Block', 'One paragraph, embedded on its own. Powers the Blocks tab — the sharp, atomic signal that catches a single on-point passage buried in an otherwise-unrelated note.'],
-      ['Whole-note vector', 'Title + body embedded together. Powers the Notes tab: “what else is about this?” Broader than a block match.'],
-      ['Body / title vectors', 'The body alone and the title alone, embedded separately. Used to measure Drift.'],
-      ['Drift', 'How well a note’s title matches its body. A low score means the note wandered away from what its title claims.'],
-      ['Consensus gate', 'Demotes a paragraph that matches between two notes which aren’t really about the same thing — the classic false positive — without hiding it.'],
-      ['Strange pairs', 'Notes whose bodies agree but whose titles don’t: same substance, different framing. A seed for cross-domain connections.'],
-      ['Gravity', 'The notes your recent thinking keeps circling, surfaced at the top of the Notes tab.'],
-      ['Cleaning', 'Before embedding, metadata lines, images, and code blocks are stripped, so only your actual prose shapes the meaning.'],
-      ['Length rules', 'Very short notes are skipped; very long ones (e.g. transcripts) are indexed by block only — the model has a token limit, so a whole-note vector would be meaningless.'],
+      ['Score', 'How alike two things are, from about 0 (unrelated) to 1 (the same).'],
+      ['Notes', 'Whole notes about the same thing as the one you’re reading.'],
+      ['Blocks', 'Single paragraphs from anywhere in the vault that match one of your paragraphs.'],
+      ['Pairs', 'Notes whose content agrees even though their titles don’t. Often the most surprising links.'],
+      ['Strong-match marker', 'The small number on a tab (Blocks³): how many of its results reach your “strong” score.'],
+      ['Gravity', 'Notes your recent writing keeps returning to, at the top of the Notes tab.'],
+      ['Drift', 'How well a note’s title still fits its content. Click it to see which paragraphs wander.'],
+      ['Re-embed', 'Rebuild the whole index. Only needed after changing the model or the length rules.'],
     ];
     for (const [term, def] of terms) {
       dl.createEl('dt', { cls: 'lc-about-term', text: term });
       dl.createEl('dd', { cls: 'lc-about-def', text: def });
     }
+  }
+
+  // Index the folder changes once the user is done clicking: a short while
+  // after the last change, or right away when the settings window closes.
+  // One vault pass for a burst of ticks, rather than one per tick.
+  scheduleRescan(ms) {
+    if (this.rescanTimer) clearTimeout(this.rescanTimer);
+    this.rescanTimer = setTimeout(() => {
+      this.rescanTimer = null;
+      this.plugin.requestVaultScan();
+    }, ms);
+  }
+
+  hide() {
+    if (this.rescanTimer) {
+      clearTimeout(this.rescanTimer);
+      this.rescanTimer = null;
+      this.plugin.requestVaultScan();
+    }
+  }
+
+  // ----- folder picker -----
+  // A button that opens the folder tree right below the setting. Ticks save
+  // immediately; indexing waits until the clicking stops (scheduleRescan).
+  buildFolderPicker(containerEl, item) {
+    const s = new Setting(containerEl).setName(item.name).setDesc(this.descFor(item));
+    if (s.settingEl) s.settingEl.addClass('lc-setting-folders');
+    let button = null;
+    s.addButton((b) => {
+      button = b;
+      b.onClick(() => { this.folderTreeOpen = !this.folderTreeOpen; render(); });
+    });
+    const panel = containerEl.createDiv();
+    if (!this.folderExpanded) this.folderExpanded = FolderTree.expandedFor(TUNABLES.INCLUDED_FOLDERS);
+    const tree = new FolderTree(this.app, panel, {
+      expanded: this.folderExpanded,
+      getSelected: () => TUNABLES.INCLUDED_FOLDERS,
+      onChange: (next) => {
+        TUNABLES.INCLUDED_FOLDERS = coerceSetting(item, next, []);
+        this.applyDebounced();     // save + refresh the panel
+        this.scheduleRescan(1500); // index / prune once the clicking stops
+        render();
+      },
+    });
+    const render = () => {
+      const open = !!this.folderTreeOpen;
+      if (button) button.setButtonText(`${FolderTree.summary(TUNABLES.INCLUDED_FOLDERS)} ${open ? '\u25B4' : '\u25BE'}`);
+      panel.toggleClass('lc-hidden', !open);
+      if (open) tree.render(); else panel.empty();
+    };
+    render();
   }
 
   descFor(item) {
@@ -2495,6 +2882,7 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
   }
 
   buildSetting(containerEl, item) {
+    if (item.type === 'folders') return this.buildFolderPicker(containerEl, item);
     const s = new Setting(containerEl).setName(item.name).setDesc(this.descFor(item));
     const val = TUNABLES[item.key];
 
@@ -2513,42 +2901,23 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
           d.setValue(String(val)).onChange((v) => this.commit(item, v, true));
         });
         break;
-      case 'slider':
+      case 'slider': {
+        // Obsidian sliders only show their value while dragged; keep a small
+        // readout beside each one so you can see where it's set at a glance.
+        const fmt = (v) => Number(v).toFixed(item.step < 0.1 ? 2 : 1);
+        const start = coerceSetting(item, val, item.min);
+        const readout = s.controlEl.createSpan({ cls: 'lc-slider-value', text: fmt(start) });
         s.addSlider((sl) => sl.setLimits(item.min, item.max, item.step)
-          .setValue(coerceSetting(item, val, item.min)).setDynamicTooltip()
-          .onChange((v) => this.commit(item, v)));
+          .setValue(start).setDynamicTooltip()
+          .onChange((v) => { readout.setText(fmt(v)); this.commit(item, v); }));
         break;
+      }
       case 'int':
       case 'number':
         s.addText((t) => {
           if (t.inputEl) t.inputEl.type = 'number';
           t.setValue(String(val)).onChange((v) => this.commit(item, v));
         });
-        break;
-      case 'folders':
-        s.addTextArea((t) => {
-          t.setValue((Array.isArray(val) ? val : []).join('\n'));
-          // What the index was last built for, so merely clicking into the box
-          // and away again doesn't trigger a vault walk + notice.
-          let indexedFor = JSON.stringify(TUNABLES[item.key]);
-          if (t.inputEl) {
-            t.inputEl.rows = 6;
-            t.inputEl.addClass('lc-folders-input');
-            // Save on each edit, but only re-index once the user clicks away —
-            // re-indexing on every keystroke would be miserable.
-            t.inputEl.addEventListener('blur', () => {
-              TUNABLES[item.key] = coerceSetting(item, t.getValue(), TUNABLE_DEFAULTS[item.key]);
-              this.plugin.saveSettings();
-              const now = JSON.stringify(TUNABLES[item.key]);
-              if (now === indexedFor) return;
-              indexedFor = now;
-              new Notice('Local Connections: updating included folders.');
-              this.plugin.embedVault(false); // embed newly-included, prune removed
-            });
-          }
-          t.onChange((v) => { TUNABLES[item.key] = coerceSetting(item, v, TUNABLE_DEFAULTS[item.key]); this.applyDebounced(); });
-        });
-        s.settingEl && s.settingEl.addClass('lc-setting-folders');
         break;
       default:
         break;
@@ -2558,10 +2927,9 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
   buildReembed(containerEl) {
     new Setting(containerEl)
       .setName('Re-embed entire vault')
-      .setDesc('Rebuild all note + block vectors from scratch. Run this after changing the model or any of the length rules above (the ⟳ settings).')
-      .addButton((b) => b.setButtonText('Re-embed').setCta().onClick(() => {
-        this.plugin.embedVault(true);
-        new Notice('Local Connections: re-embedding the vault.');
+      .setDesc('Rebuild the index from scratch. Only needed after changing the model or a length rule (marked \u27F3).')
+      .addButton((b) => b.setButtonText('Re-embed').onClick(() => {
+        if (this.plugin.reembedAll()) new Notice('Local Connections: re-embedding the vault.');
       }));
   }
 }
