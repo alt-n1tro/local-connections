@@ -1934,9 +1934,12 @@ class ConnectionsView extends ItemView {
   renderResultTabs(container, result, sourceFile, linkedSet, gravity) {
     // Same short labels in both modes — the panel is narrow, and "Similar" adds
     // no information the tab position doesn't already carry.
+    // Notes and Blocks carry no count: they nearly always fill to their result
+    // limit, so the number was the same every time. Pairs keeps its count since
+    // it genuinely varies (and the tab only exists when there's at least one).
     const tabsDef = [
-      { id: 'notes', label: 'Notes', count: result.notes.length },
-      { id: 'blocks', label: 'Blocks', count: result.blocks.length },
+      { id: 'notes', label: 'Notes', count: null },
+      { id: 'blocks', label: 'Blocks', count: null },
     ];
     // "Pairs" only appears when there's at least one — an empty tab would just
     // be a dead click, so the tab bar quietly reverts to two tabs.
@@ -1966,7 +1969,7 @@ class ConnectionsView extends ItemView {
         const what = def.id === 'strange' ? ' with body agreement' : '';
         tab.setAttr('title', `${n} ${noun}${what} ≥ ${strongMin[def.id].toFixed(TUNABLES.SCORE_DECIMALS)}`);
       }
-      tab.createSpan({ cls: 'lc-tab-count', text: String(def.count) });
+      if (def.count != null) tab.createSpan({ cls: 'lc-tab-count', text: String(def.count) });
       tab.addEventListener('click', () => {
         if (this.activeTab !== def.id) { this.activeTab = def.id; this.render(); }
       });
