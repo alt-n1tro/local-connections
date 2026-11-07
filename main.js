@@ -106,6 +106,16 @@ const TUNABLES = {
   STRANGE_MIN_DELTA: 0.15,  // ...and agree this much MORE than the titles do
   STRANGE_RESULT_LIMIT: 15,
 
+  // --- strong-match markers (superscript on each tab label, e.g. "Blocks³") ---
+  // Counts how many of a tab's results reach this score, so a strong match in
+  // a tab you aren't looking at still catches your eye. Notes and Blocks are
+  // compared against the score as displayed on the row (raw or scaled, per
+  // DISPLAY_SCORE); Pairs against the body agreement on the "body" sub-line.
+  // Only in the note-relative view, not in semantic search.
+  STRONG_NOTE_MIN: 0.8,
+  STRONG_BLOCK_MIN: 0.8,
+  STRONG_PAIR_MIN: 0.7,
+
   // --- gravity (top of Similar notes) ---
   // Which notes your RECENT thinking keeps circling: take the N most recently
   // touched notes, look at each one's top-K whole-note neighbours, and surface
@@ -233,6 +243,18 @@ const SETTINGS_SCHEMA = [
         desc: '…and their bodies must agree this much MORE than their titles do. Higher = only “same idea, very different framing” pairs.\nDefault: 0.15' },
       { key: 'STRANGE_RESULT_LIMIT', name: 'Max pairs', type: 'int', min: 1,
         desc: 'How many pairs to show.\nDefault: 15' },
+    ],
+  },
+  {
+    name: 'Strong-match markers',
+    desc: 'A small superscript on each tab (Blocks³) counting how many of its results score at or above these, so a strong match doesn’t go unnoticed in a tab you aren’t looking at. Counts only the rows the tab actually shows. Set a slider to 1 to effectively turn that marker off.',
+    items: [
+      { key: 'STRONG_NOTE_MIN', name: 'Notes: strong match at', type: 'slider', min: 0.5, max: 1, step: 0.01,
+        desc: 'A Notes-tab row counts once its displayed score reaches this.\nDefault: 0.8' },
+      { key: 'STRONG_BLOCK_MIN', name: 'Blocks: strong match at', type: 'slider', min: 0.5, max: 1, step: 0.01,
+        desc: 'A Blocks-tab row counts once its displayed score reaches this.\nDefault: 0.8' },
+      { key: 'STRONG_PAIR_MIN', name: 'Pairs: strong match at', type: 'slider', min: 0.5, max: 1, step: 0.01,
+        desc: 'A pair counts once its body agreement (the “body” number on its sub-line) reaches this.\nDefault: 0.7' },
     ],
   },
   {
@@ -1601,9 +1623,36 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     }
   }
 
+  // The number a row displays: raw cosine or its power-scaled value.
+  displayScore(raw, scaled) {
+    return TUNABLES.DISPLAY_SCORE === 'scaled' ? scaled : raw;
+  }
+
   formatScore(raw, scaled) {
-    const val = TUNABLES.DISPLAY_SCORE === 'scaled' ? scaled : raw;
-    return val.toFixed(TUNABLES.SCORE_DECIMALS);
+    return this.displayScore(raw, scaled).toFixed(TUNABLES.SCORE_DECIMALS);
+  }
+
+  // Does a score clear a strong-match threshold? Compared as DISPLAYED (rounded
+  // to SCORE_DECIMALS) so a row reading "0.800" counts toward 0.8 even when the
+  // underlying value is 0.7996 — the marker must agree with what you see.
+  isStrong(value, threshold) {
+    if (typeof value !== 'number' || !isFinite(value)) return false;
+    return Number(value.toFixed(TUNABLES.SCORE_DECIMALS)) >= threshold - 1e-9;
+  }
+
+  // Per-tab strong-match counts for the superscript markers. Counts the rows
+  // each tab actually shows (post-limit, linked notes already excluded), using
+  // the same number each row displays.
+  strongCounts(result) {
+    const count = (list, valueOf, threshold) =>
+      (list || []).reduce((n, r) => n + (this.isStrong(valueOf(r), threshold) ? 1 : 0), 0);
+    return {
+      notes: count(result.notes, (r) => this.displayScore(r.raw, r.scaled), TUNABLES.STRONG_NOTE_MIN),
+      // Blocks display `combined` (gate-adjusted) when present — see renderBlocksTab.
+      blocks: count(result.blocks, (r) => this.displayScore(r.combined != null ? r.combined : r.raw, r.scaled), TUNABLES.STRONG_BLOCK_MIN),
+      // Pairs: body agreement, always shown raw on the sub-line.
+      strange: count(result.strange, (r) => r.raw, TUNABLES.STRONG_PAIR_MIN),
+    };
   }
 };
 
@@ -1874,12 +1923,28 @@ class ConnectionsView extends ItemView {
       tabsDef.push({ id: 'strange', label: 'Pairs', count: result.strange.length });
     }
 
+    // Strong-match markers: a superscript on the label ("Blocks³") counting rows
+    // at/above that tab's threshold. Note-relative view only — search scores are
+    // query-vs-note, not note-vs-note, so the thresholds don't carry over.
+    const strong = this.searchMode ? null : this.plugin.strongCounts(result);
+    const strongMin = { notes: TUNABLES.STRONG_NOTE_MIN, blocks: TUNABLES.STRONG_BLOCK_MIN, strange: TUNABLES.STRONG_PAIR_MIN };
+    const strongNoun = { notes: ['note', 'notes'], blocks: ['block', 'blocks'], strange: ['pair', 'pairs'] };
+
     const tabs = (this._header || container).createDiv({ cls: 'lc-tabs' });
     for (const def of tabsDef) {
       const tab = tabs.createEl('button', {
         cls: 'lc-tab' + (this.activeTab === def.id ? ' lc-tab-active' : ''),
-        text: def.label,
       });
+      // Label and superscript share one span so the exponent hugs the word
+      // instead of sitting a flex-gap away from it.
+      const label = tab.createSpan({ cls: 'lc-tab-label', text: def.label });
+      const n = strong ? strong[def.id] : 0;
+      if (n > 0) {
+        label.createEl('sup', { cls: 'lc-tab-strong', text: String(n) });
+        const noun = strongNoun[def.id][n === 1 ? 0 : 1];
+        const what = def.id === 'strange' ? ' with body agreement' : '';
+        tab.setAttr('title', `${n} ${noun}${what} ≥ ${strongMin[def.id].toFixed(TUNABLES.SCORE_DECIMALS)}`);
+      }
       tab.createSpan({ cls: 'lc-tab-count', text: String(def.count) });
       tab.addEventListener('click', () => {
         if (this.activeTab !== def.id) { this.activeTab = def.id; this.render(); }
