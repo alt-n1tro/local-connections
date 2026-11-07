@@ -795,6 +795,33 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     this.embedVault(false);
   }
 
+  // How much is indexed, for the Live/Paused button's hover text. One pass over
+  // the index adding up paragraph counts: about 3 ms at 10k notes, run only
+  // when the panel re-renders. Memory is an estimate (each vector is 1,024 numbers at 8 bytes,
+  // plus paragraph text), not a measurement.
+  storeStats() {
+    let notes = 0, paragraphs = 0, vectors = 0, chars = 0;
+    for (const entry of Object.values(this.store || {})) {
+      if (!entry) continue;
+      notes++;
+      if (entry.noteVec) vectors++;
+      if (entry.bodyVec) vectors++;
+      if (entry.titleVec) vectors++;
+      for (const b of entry.blocks || []) {
+        paragraphs++;
+        if (b.vec) vectors++;
+        chars += b.text ? b.text.length : 0;
+      }
+    }
+    const dim = TUNABLES.EXPECTED_DIM || 1024;
+    const mb = (vectors * dim * 8 + chars * 2) / (1024 * 1024);
+    const fmt = (n) => n.toLocaleString('en-US');
+    return {
+      notes, paragraphs, mb,
+      text: `${fmt(notes)} notes \u00B7 ${fmt(paragraphs)} paragraphs indexed (\u2248 ${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB in memory)`,
+    };
+  }
+
   // Has the user picked anything to index? With nothing picked, every note is
   // excluded, so a vault pass would prune the whole index: embedVault refuses
   // to run, and the panel asks for folders instead.
@@ -1888,14 +1915,15 @@ class ConnectionsView extends ItemView {
       cls: 'lc-pause' + (showPaused ? ' lc-paused' : ''),
     });
     pauseBtn.createSpan({ cls: 'lc-pause-label', text: showPaused ? 'Paused' : 'Live' });
-    pauseBtn.setAttr(
-      'title',
-      noFolders
-        ? 'No folders chosen yet. Click to choose what to index.'
-        : this.plugin.paused
-          ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
-          : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.'
-    );
+    // Hover text only: how much is indexed, under the usual hint. Nothing is
+    // shown in the panel itself.
+    const hint = noFolders
+      ? 'No folders chosen yet. Click to choose what to index.'
+      : this.plugin.paused
+        ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
+        : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.';
+    const stats = this.plugin.storeStats();
+    pauseBtn.setAttr('title', stats.notes > 0 ? `${hint}\n\n${stats.text}` : hint);
     pauseBtn.addEventListener('click', () => {
       this.plugin.togglePause();
       // togglePause flips paused synchronously, but its refreshView() skips
