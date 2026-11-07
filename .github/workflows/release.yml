@@ -1,0 +1,69 @@
+# Prepares a release whenever the version in manifest.json changes on main.
+#
+# 1. Checks that manifest.json, versions.json and the files are consistent.
+# 2. Creates GitHub artifact attestations for main.js, manifest.json and
+#    styles.css (proof they came from this repository at this commit).
+# 3. Creates a DRAFT release for that version with the three files attached.
+#
+# Then open the draft on GitHub, write the release notes and click Publish.
+# Don't attach or replace files by hand: they'd no longer match the attestations.
+name: Prepare release
+
+on:
+  push:
+    branches: [main]
+    paths: [manifest.json]
+  workflow_dispatch: # "Run workflow" button, e.g. to retry
+
+permissions:
+  contents: write      # create the draft release
+  id-token: write      # sign the attestations
+  attestations: write  # store the attestations
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version and files
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version manifest.json)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::manifest.json version \"$version\" isn't x.y.z"; exit 1
+          fi
+          if ! jq -e --arg v "$version" 'has($v)' versions.json > /dev/null; then
+            echo "::error::versions.json has no entry for $version"; exit 1
+          fi
+          node --check main.js
+          test -s styles.css
+          if gh release view "$version" > /dev/null 2>&1; then
+            echo "::notice::A release for $version already exists; nothing to do. Bump the version to make a new one."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the release files
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Create draft release
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          gh release create "$VERSION" main.js manifest.json styles.css \
+            --draft --target "$GITHUB_SHA" --title "$VERSION" \
+            --notes "Write the release notes here, then publish."
