@@ -352,6 +352,16 @@
   border-bottom-color: var(--interactive-accent);
 }
 
+/* Strong-match marker: a plain exponent on the tab label ("Blocks³").
+   Inherits the label's colour; line-height 0 keeps it from growing the tab. */
+.local-connections-panel .lc-tab-strong {
+  font-size: 0.7em;
+  font-weight: var(--font-normal);
+  line-height: 0;
+  margin-left: 1px;
+  font-variant-numeric: tabular-nums;
+}
+
 .local-connections-panel .lc-tab-count {
   font-family: var(--font-monospace);
   font-size: var(--font-smallest);
