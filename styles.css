@@ -663,6 +663,12 @@
    Settings tab
    ==========================================================================*/
 
+/* "1,284 notes · 5,136 paragraphs indexed" line at the top of the settings. */
+.lc-settings .lc-index-stats {
+  margin: 0 0 0.4em 0;
+  font-variant-numeric: tabular-nums;
+}
+
 /* A short blurb under each category heading. */
 .lc-settings .lc-cat-desc {
   margin: -0.4em 0 0.6em 0;

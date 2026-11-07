@@ -923,9 +923,9 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     this.embedVault(false);
   }
 
-  // How much is indexed, for the Live/Paused button's hover text. One pass over
+  // How much is indexed, shown at the top of the settings tab. One pass over
   // the index adding up paragraph counts: about 3 ms at 10k notes, run only
-  // when the panel re-renders. Memory is an estimate (each vector is 1,024
+  // when the settings tab opens. Memory is an estimate (each vector is 1,024
   // float32s at 4 bytes, plus paragraph text), not a measurement.
   storeStats() {
     let notes = 0, paragraphs = 0, vectors = 0, chars = 0;
@@ -946,7 +946,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     const fmt = (n) => n.toLocaleString('en-US');
     return {
       notes, paragraphs, mb,
-      text: `${fmt(notes)} notes \u00B7 ${fmt(paragraphs)} paragraphs indexed (\u2248 ${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB in memory)`,
+      text: `${fmt(notes)} ${notes === 1 ? 'note' : 'notes'} \u00B7 ${fmt(paragraphs)} ${paragraphs === 1 ? 'paragraph' : 'paragraphs'} indexed (\u2248 ${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB in memory)`,
     };
   }
 
@@ -2295,15 +2295,12 @@ class ConnectionsView extends ItemView {
       cls: 'lc-pause' + (showPaused ? ' lc-paused' : ''),
     });
     pauseBtn.createSpan({ cls: 'lc-pause-label', text: showPaused ? 'Paused' : 'Live' });
-    // Hover text only: how much is indexed, under the usual hint. Nothing is
-    // shown in the panel itself.
     const hint = noFolders
       ? 'No folders chosen yet. Click to choose what to index.'
       : this.plugin.paused
         ? 'Embedding is paused. Edits won\u2019t re-embed. Click to resume and catch up.'
         : 'Pause live re-embedding while you write. The panel keeps working off existing vectors.';
-    const stats = this.plugin.storeStats();
-    pauseBtn.setAttr('title', stats.notes > 0 ? `${hint}\n\n${stats.text}` : hint);
+    pauseBtn.setAttr('title', hint);
     pauseBtn.addEventListener('click', () => {
       this.plugin.togglePause();
       // togglePause flips paused synchronously, but its refreshView() skips
@@ -3139,6 +3136,13 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass('lc-settings');
+
+    // One quiet line: how much is indexed right now.
+    const stats = this.plugin.storeStats();
+    containerEl.createDiv({
+      cls: 'setting-item-description lc-index-stats',
+      text: stats.notes > 0 ? stats.text : 'Nothing indexed yet.',
+    });
 
     this.buildGlossary(containerEl);
 
