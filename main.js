@@ -663,7 +663,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     this.addRibbonIcon('waypoints', 'Local Connections', () => this.activateView());
 
     this.addCommand({
-      id: 'open-local-connections',
+      id: 'open-panel',
       name: 'Open Local Connections panel',
       callback: () => this.activateView(),
     });
@@ -2328,7 +2328,7 @@ class ConnectionsView extends ItemView {
     // same two-tab results into the panel without touching the open note.
     const searchBtn = toolbar.createEl('button', {
       cls: 'lc-search-btn' + (this.searchMode ? ' lc-search-active' : ''),
-      text: 'Semantic Search',
+      text: 'Semantic search',
     });
     searchBtn.setAttr('title', 'Search notes and blocks by meaning. Type a sentence and press Enter.');
     searchBtn.addEventListener('click', () => this.toggleSearch());
