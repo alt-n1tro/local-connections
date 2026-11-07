@@ -1050,23 +1050,40 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     // removing the old file and renaming the new one in). Losing one save is
     // fine; silently re-embedding the whole vault is not.
     let loaded = null;
+    let recovered = false;
     for (const path of [this.storePath, this.tempStorePath]) {
       const parsed = await this._readStoreFile(path);
       if (!parsed) continue;
       loaded = await this._decodeStore(parsed);
       if (loaded) {
-        if (path !== this.storePath) console.warn('[Local Connections] recovered vector store from the scratch file');
+        recovered = path !== this.storePath;
+        if (recovered) console.warn('[Local Connections] recovered vector store from the scratch file');
         break;
       }
     }
-    // Any leftover scratch file is stale by now — drop it so it can't be mistaken
-    // for a newer store on a later launch.
-    try { await this.app.vault.adapter.remove(this.tempStorePath); } catch (e) { /* none */ }
 
     // Whatever we end up holding was built with (or is empty for) this model.
     this.storeModel = TUNABLES.MODEL;
     this._binName = loaded ? loaded.binName : null;
     this.store = loaded ? loaded.vectors : {};
+
+    if (recovered) {
+      // The scratch file was the only good copy. Promote it to vectors.json
+      // now (it already names its own .bin) instead of deleting it: otherwise,
+      // if Obsidian closed before the next save, the next launch would find
+      // nothing and re-embed the whole vault. If promoting fails, the scratch
+      // file stays put and is recovered again next launch.
+      const adapter = this.app.vault.adapter;
+      try {
+        if (await adapter.exists(this.storePath)) await adapter.remove(this.storePath); // unusable anyway
+        await adapter.rename(this.tempStorePath, this.storePath);
+      } catch (e) { /* leave the scratch file for next time */ }
+      await this._removeStrayBins(this._binName);
+      return;
+    }
+    // Any leftover scratch file is stale by now — drop it so it can't be mistaken
+    // for a newer store on a later launch.
+    try { await this.app.vault.adapter.remove(this.tempStorePath); } catch (e) { /* none */ }
     // Binary files no store file points at (a save interrupted after writing
     // its .bin, or a superseded one whose delete failed). Only when something
     // loaded: if nothing did, keep everything for a manual recovery.
@@ -1097,7 +1114,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
         if (ref == null) return { ok: true, v: ref };
         if (!Array.isArray(ref) || ref.length !== 2) return { ok: false };
         const [o, n] = ref;
-        if (!Number.isInteger(o) || !Number.isInteger(n) || o < 0 || n <= 0 || o + n > floats.length) return { ok: false };
+        if (!Number.isInteger(o) || !Number.isInteger(n) || o < 0 || n < 0 || o + n > floats.length) return { ok: false };
         return { ok: true, v: floats.subarray(o, o + n) };
       };
       for (const entry of Object.values(vectors)) {
@@ -1266,7 +1283,13 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     // touched, so vectors.json and the .bin it names always match, whenever
     // we're interrupted. The old .bin is removed only after the new
     // vectors.json is in place.
-    const binName = `vectors-${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}.bin`;
+    // Time + a per-session counter + random: unique in practice, and never the
+    // name of the file currently in use (overwriting that would break the pair).
+    let binName;
+    do {
+      this._saveSeq = (this._saveSeq || 0) + 1;
+      binName = `vectors-${Date.now().toString(36)}${this._saveSeq.toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}.bin`;
+    } while (binName === this._binName);
     const binPath = `${this.storeDir}/${binName}`;
     let wroteBin = false;
     try {
