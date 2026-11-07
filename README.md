@@ -46,7 +46,7 @@ The settings page only shows the basics: the Ollama address and model, which fol
 
 ## Privacy
 
-The plugin only talks to your Ollama server (`http://localhost:11434` unless you change it). The index is saved as `vectors.json` in the plugin's folder.
+The plugin only talks to your Ollama server (`http://localhost:11434` unless you change it). The index is saved in the plugin's folder (`vectors.json` plus a `vectors-….bin` file with the numbers).
 
 ## How it was made
 

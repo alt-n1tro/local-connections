@@ -372,7 +372,14 @@ const VIEW_TYPE = 'local-connections-view';
 //   v3: noteVec = embed(title + body), may be null for over-length docs.
 //   v4: adds bodyVec = embed(body) (for title-vs-body drift) and per-field
 //       titleHash / bodyHash for precise, cheap reuse. v2/v3 migrate in place.
-const STORE_FORMAT = 4;
+//   v5: vectors move out of the JSON into a binary file of float32s
+//       (vectors-<id>.bin); each vector in the JSON becomes [offset, length]
+//       into it. Written as text, every number took ~21 characters, so a vault
+//       of a few thousand notes produced a JSON string longer than JavaScript
+//       allows (~512M chars) and saving silently failed. Binary is ~5x smaller
+//       on disk and half the memory. v2-v4 files are read and converted on the
+//       next save, without re-embedding.
+const STORE_FORMAT = 5;
 
 // Version of the TEXT CLEANING rules in splitIntoBlocks().
 //
@@ -797,8 +804,8 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
 
   // How much is indexed, for the Live/Paused button's hover text. One pass over
   // the index adding up paragraph counts: about 3 ms at 10k notes, run only
-  // when the panel re-renders. Memory is an estimate (each vector is 1,024 numbers at 8 bytes,
-  // plus paragraph text), not a measurement.
+  // when the panel re-renders. Memory is an estimate (each vector is 1,024
+  // float32s at 4 bytes, plus paragraph text), not a measurement.
   storeStats() {
     let notes = 0, paragraphs = 0, vectors = 0, chars = 0;
     for (const entry of Object.values(this.store || {})) {
@@ -814,7 +821,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       }
     }
     const dim = TUNABLES.EXPECTED_DIM || 1024;
-    const mb = (vectors * dim * 8 + chars * 2) / (1024 * 1024);
+    const mb = (vectors * dim * 4 + chars * 2) / (1024 * 1024);
     const fmt = (n) => n.toLocaleString('en-US');
     return {
       notes, paragraphs, mb,
@@ -1037,14 +1044,20 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   }
 
   async loadStore() {
-    // Try the real file; if it's missing or unreadable/corrupt, fall back to the
-    // scratch file a previous save may have left behind (we can be killed in the
-    // narrow window between removing the old file and renaming the new one in).
-    // Losing one save is fine; silently re-embedding the whole vault is not.
-    let parsed = await this._readStoreFile(this.storePath);
-    if (!parsed) {
-      parsed = await this._readStoreFile(this.tempStorePath);
-      if (parsed) console.warn('[Local Connections] recovered vector store from the scratch file');
+    // Try the real file; if it's missing, unreadable, corrupt, or its binary
+    // file is missing/doesn't match, fall back to the scratch file a previous
+    // save may have left behind (we can be killed in the narrow window between
+    // removing the old file and renaming the new one in). Losing one save is
+    // fine; silently re-embedding the whole vault is not.
+    let loaded = null;
+    for (const path of [this.storePath, this.tempStorePath]) {
+      const parsed = await this._readStoreFile(path);
+      if (!parsed) continue;
+      loaded = await this._decodeStore(parsed);
+      if (loaded) {
+        if (path !== this.storePath) console.warn('[Local Connections] recovered vector store from the scratch file');
+        break;
+      }
     }
     // Any leftover scratch file is stale by now — drop it so it can't be mistaken
     // for a newer store on a later launch.
@@ -1052,18 +1065,72 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
 
     // Whatever we end up holding was built with (or is empty for) this model.
     this.storeModel = TUNABLES.MODEL;
-    if (!parsed || parsed.model !== TUNABLES.MODEL || !parsed.vectors) {
-      this.store = {};
-      return;
-    }
+    this._binName = loaded ? loaded.binName : null;
+    this.store = loaded ? loaded.vectors : {};
+    // Binary files no store file points at (a save interrupted after writing
+    // its .bin, or a superseded one whose delete failed). Only when something
+    // loaded: if nothing did, keep everything for a manual recovery.
+    if (loaded) await this._removeStrayBins(this._binName);
+  }
+
+  // Turn a parsed vectors.json into an in-memory store, or null if it can't be
+  // used (wrong model, unknown format, binary file missing or inconsistent).
+  // Every vector comes out as a Float32Array.
+  async _decodeStore(parsed) {
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.model !== TUNABLES.MODEL || !parsed.vectors || typeof parsed.vectors !== 'object') return null;
+    const vectors = parsed.vectors;
+
     if (parsed.format === STORE_FORMAT) {
-      this.store = parsed.vectors;
-    } else if (parsed.format === 2 || parsed.format === 3) {
-      this.migrateStore(parsed.vectors, parsed.format);
-      this.store = parsed.vectors;
-    } else {
-      this.store = {};
+      if (typeof parsed.bin !== 'string' || !/^vectors-[a-z0-9]+\.bin$/.test(parsed.bin)) return null;
+      if (!Number.isInteger(parsed.floats) || parsed.floats < 0) return null;
+      let buf;
+      try { buf = await this.app.vault.adapter.readBinary(`${this.storeDir}/${parsed.bin}`); } catch (e) { return null; }
+      // Some adapters hand back a typed view (e.g. a Node Buffer) rather than a
+      // bare ArrayBuffer; take exactly its bytes.
+      if (buf && ArrayBuffer.isView(buf)) buf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+      if (!buf || buf.byteLength !== parsed.floats * 4) return null; // truncated or mismatched
+      const floats = new Float32Array(buf);
+      // Each vector is a view into the one buffer; no copying. Any reference
+      // that doesn't fit inside the buffer means the pair doesn't match.
+      const view = (ref) => {
+        if (ref == null) return { ok: true, v: ref };
+        if (!Array.isArray(ref) || ref.length !== 2) return { ok: false };
+        const [o, n] = ref;
+        if (!Number.isInteger(o) || !Number.isInteger(n) || o < 0 || n <= 0 || o + n > floats.length) return { ok: false };
+        return { ok: true, v: floats.subarray(o, o + n) };
+      };
+      for (const entry of Object.values(vectors)) {
+        if (!entry || typeof entry !== 'object') return null;
+        for (const k of ['noteVec', 'bodyVec', 'titleVec']) {
+          if (!(k in entry)) continue;
+          const r = view(entry[k]);
+          if (!r.ok) return null;
+          entry[k] = r.v;
+        }
+        for (const blk of Array.isArray(entry.blocks) ? entry.blocks : []) {
+          if (!blk || !('vec' in blk)) continue;
+          const r = view(blk.vec);
+          if (!r.ok) return null;
+          blk.vec = r.v;
+        }
+      }
+      return { vectors, binName: parsed.bin };
     }
+
+    // v2-v4: vectors stored inline as JSON arrays. Convert in place; the next
+    // save writes the binary format.
+    if (parsed.format === 4 || parsed.format === 3 || parsed.format === 2) {
+      if (parsed.format !== 4) this.migrateStore(vectors, parsed.format);
+      const f32 = (v) => (Array.isArray(v) ? Float32Array.from(v) : v);
+      for (const entry of Object.values(vectors)) {
+        if (!entry || typeof entry !== 'object') continue;
+        for (const k of ['noteVec', 'bodyVec', 'titleVec']) if (k in entry) entry[k] = f32(entry[k]);
+        for (const blk of Array.isArray(entry.blocks) ? entry.blocks : []) if (blk && 'vec' in blk) blk.vec = f32(blk.vec);
+      }
+      return { vectors, binName: null };
+    }
+    return null;
   }
 
   // Read + parse one candidate store file. Returns null if absent or unparseable.
@@ -1106,6 +1173,55 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     return this.storePath + '.tmp';
   }
 
+  get storeDir() {
+    return `${this.app.vault.configDir}/plugins/local-connections`;
+  }
+
+  // Delete every vectors-*.bin in the plugin folder except `keep`.
+  async _removeStrayBins(keep) {
+    const adapter = this.app.vault.adapter;
+    if (!adapter.list) return;
+    let listing;
+    try { listing = await adapter.list(this.storeDir); } catch (e) { return; }
+    for (const full of (listing && listing.files) || []) {
+      const name = full.split('/').pop();
+      if (!/^vectors-[a-z0-9]+\.bin$/.test(name) || name === keep) continue;
+      try { await adapter.remove(full); } catch (e) { /* try again next time */ }
+    }
+  }
+
+  // Split the store into the JSON part (vectors replaced by [offset, length])
+  // and one Float32Array holding every vector back to back. The live store
+  // isn't modified.
+  _packStore() {
+    let total = 0;
+    for (const entry of Object.values(this.store)) {
+      if (!entry) continue;
+      for (const k of ['noteVec', 'bodyVec', 'titleVec']) if (entry[k]) total += entry[k].length;
+      for (const blk of entry.blocks || []) if (blk && blk.vec) total += blk.vec.length;
+    }
+    const floats = new Float32Array(total);
+    let at = 0;
+    const put = (v) => {
+      if (!v) return v; // null stays null (e.g. an over-length note's noteVec)
+      const ref = [at, v.length];
+      floats.set(v, at);
+      at += v.length;
+      return ref;
+    };
+    const vectors = {};
+    for (const [path, entry] of Object.entries(this.store)) {
+      if (!entry) continue;
+      const out = Object.assign({}, entry);
+      for (const k of ['noteVec', 'bodyVec', 'titleVec']) if (k in entry) out[k] = put(entry[k]);
+      if (Array.isArray(entry.blocks)) {
+        out.blocks = entry.blocks.map((blk) => (blk && 'vec' in blk ? Object.assign({}, blk, { vec: put(blk.vec) }) : blk));
+      }
+      vectors[path] = out;
+    }
+    return { vectors, floats };
+  }
+
   // Persist the vector store.
   //
   // Two protections, both learned the hard way:
@@ -1144,14 +1260,26 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   }
 
   async _doSaveStore() {
-    const payload = JSON.stringify({
-      model: this.storeModel || TUNABLES.MODEL,
-      format: STORE_FORMAT,
-      updated_at: Date.now(),
-      vectors: this.store,
-    });
     const adapter = this.app.vault.adapter;
+    const { vectors, floats } = this._packStore();
+    // A fresh name every save: the binary file currently on disk is never
+    // touched, so vectors.json and the .bin it names always match, whenever
+    // we're interrupted. The old .bin is removed only after the new
+    // vectors.json is in place.
+    const binName = `vectors-${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}.bin`;
+    const binPath = `${this.storeDir}/${binName}`;
+    let wroteBin = false;
     try {
+      await adapter.writeBinary(binPath, floats.buffer);
+      wroteBin = true;
+      const payload = JSON.stringify({
+        model: this.storeModel || TUNABLES.MODEL,
+        format: STORE_FORMAT,
+        updated_at: Date.now(),
+        bin: binName,
+        floats: floats.length,
+        vectors,
+      });
       // Write to a scratch file first, then swap it in.
       await adapter.write(this.tempStorePath, payload);
       if (adapter.rename) {
@@ -1172,9 +1300,20 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       }
     } catch (e) {
       console.error('[Local Connections] failed to save vector store', e);
-      // Never leave a half-written scratch file lying around.
-      try { await adapter.remove(this.tempStorePath); } catch (e2) { /* ignore */ }
+      // If vectors.json is gone (we cleared it for a rename that then failed),
+      // the scratch file and its new .bin are the only copy: keep both, and
+      // loadStore() recovers from them. Otherwise the previous pair on disk is
+      // untouched and valid, so drop the half-done scratch file and new .bin.
+      let realExists = true;
+      try { realExists = await adapter.exists(this.storePath); } catch (e2) { /* assume it does */ }
+      if (realExists) {
+        try { await adapter.remove(this.tempStorePath); } catch (e2) { /* ignore */ }
+        if (wroteBin) { try { await adapter.remove(binPath); } catch (e2) { /* ignore */ } }
+      }
+      return;
     }
+    this._binName = binName;
+    await this._removeStrayBins(binName);
   }
 
   isExcluded(file) {
@@ -1235,17 +1374,19 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   // Reject a vector whose width isn't what the rest of the store uses. Mixing
   // dimensions is silent poison: cosine() returns -1 for mismatched lengths, so
   // affected notes simply stop matching anything, with no error anywhere.
+  // Also converts it to a Float32Array, the in-memory (and on-disk) form of
+  // every vector: half the memory of a plain array of doubles, and the model's
+  // own precision anyway.
   _checkDim(vec) {
     const want = TUNABLES.EXPECTED_DIM;
-    if (!want) return vec;
     if (!Array.isArray(vec)) throw new Error('Ollama returned a non-array embedding');
-    if (vec.length !== want) {
+    if (want && vec.length !== want) {
       throw new Error(
         `Ollama returned a ${vec.length}-dim embedding, expected ${want}. ` +
         `Wrong model, or "${TUNABLES.MODEL}" changed — re-embed the vault after fixing it.`
       );
     }
-    return vec;
+    return Float32Array.from(vec);
   }
 
   async embedText(text) {
