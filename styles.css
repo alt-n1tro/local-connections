@@ -19,33 +19,6 @@
   overflow-x: hidden;
 }
 
-/* section headers */
-.local-connections-panel .lc-section-header {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  padding: 12px 12px 6px 12px;
-  border-bottom: 1px solid var(--background-modifier-border);
-  position: sticky;
-  top: 0;
-  background: var(--background-secondary);
-  z-index: 1;
-}
-
-.local-connections-panel .lc-section-title {
-  font-size: var(--font-ui-small);
-  font-weight: var(--font-semibold);
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-.local-connections-panel .lc-section-count {
-  font-family: var(--font-monospace);
-  font-size: var(--font-smallest);
-  color: var(--text-faint);
-}
-
 .local-connections-panel .lc-banner {
   padding: 8px 12px;
   font-size: var(--font-smallest);
