@@ -352,7 +352,6 @@ function coerceSetting(item, raw, fallback) {
       return Array.isArray(fallback) ? fallback.slice() : [];
     }
     case 'int':
-    case 'number':
     case 'slider': {
       let n = typeof raw === 'number' ? raw : parseFloat(raw);
       if (!isFinite(n)) return fallback;
@@ -372,13 +371,13 @@ const VIEW_TYPE = 'local-connections-view';
 //   v3: noteVec = embed(title + body), may be null for over-length docs.
 //   v4: adds bodyVec = embed(body) (for title-vs-body drift) and per-field
 //       titleHash / bodyHash for precise, cheap reuse. v2/v3 migrate in place.
-//   v5: (short-lived) vectors.json + a separate vectors-<id>.bin of float32s.
+//   v5: (never released) vectors.json + a separate vectors-<id>.bin.
 //   v6: ONE file, vectors.bin. Written as JSON text, every number took ~21
 //       characters, so a vault of a few thousand notes produced a string longer
 //       than JavaScript allows (~512M chars) and saving silently failed. Binary
-//       is ~5x smaller on disk and half the memory. Older vectors.json files
-//       (v2-v5) are converted once at startup, checked number by number, and
-//       only then deleted (see convertLegacyStore).
+//       is ~5x smaller on disk and half the memory. A v4 vectors.json (written
+//       by every release before 1.3.0) is converted once at startup, checked
+//       number by number, and only then deleted (see convertLegacyStore).
 //
 // vectors.bin layout (little-endian):
 //   0   4 bytes  magic "LCVS"
@@ -472,9 +471,8 @@ function compareStores(a, b) {
 }
 
 // Check every float in a converted store against the original JSON numbers
-// (each must equal that number rounded to float32). v2's noteVec is dropped
-// by design during migration, so it's the one vector allowed to be missing.
-function compareRawNumbers(raw, conv, format) {
+// (each must equal that number rounded to float32).
+function compareRawNumbers(raw, conv) {
   if (!raw || typeof raw !== 'object') return { ok: false, reason: 'original numbers unavailable' };
   const check = (orig, v, where) => {
     if (!Array.isArray(orig)) return v == null || v === undefined ? null : `${where}: unexpected vector`;
@@ -488,7 +486,6 @@ function compareRawNumbers(raw, conv, format) {
     const c = conv[path];
     if (!e || !c) return { ok: false, reason: `"${path}" missing` };
     for (const k of ['noteVec', 'bodyVec', 'titleVec']) {
-      if (k === 'noteVec' && format < 3) continue;
       const err = check(e[k], c[k], `${k} of "${path}"`);
       if (err) return { ok: false, reason: err };
     }
@@ -1286,7 +1283,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
       const parsed = await this._readJson(path);
       if (!parsed) continue;
       const vectors = await this._decodeLegacy(parsed);
-      if (vectors) return { vectors, updatedAt: Number(parsed.updated_at) || 0, format: parsed.format, path };
+      if (vectors) return { vectors, updatedAt: Number(parsed.updated_at) || 0, path };
     }
     return null;
   }
@@ -1300,33 +1297,20 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
   }
 
   // Turn a parsed legacy vectors.json into an in-memory store (every vector a
-  // Float32Array), or null if it can't be used.
-  //   v2-v4: vectors inline as JSON arrays.
-  //   v5:    vectors as [offset, length] into the vectors-<id>.bin it names.
+  // Float32Array), or null if it can't be used. Every released version before
+  // 1.3.0 wrote format 4: vectors inline as JSON arrays. Anything else is
+  // ignored (left on disk untouched, never deleted).
   async _decodeLegacy(parsed) {
-    if (!parsed || typeof parsed !== 'object') return null;
+    if (!parsed || typeof parsed !== 'object' || parsed.format !== 4) return null;
     if (parsed.model !== TUNABLES.MODEL || !parsed.vectors || typeof parsed.vectors !== 'object') return null;
     const vectors = parsed.vectors;
-    if (parsed.format === 5) {
-      if (typeof parsed.bin !== 'string' || !/^vectors-[a-z0-9]+\.bin$/.test(parsed.bin)) return null;
-      if (!Number.isInteger(parsed.floats) || parsed.floats < 0) return null;
-      let buf;
-      try { buf = await this.app.vault.adapter.readBinary(`${this.storeDir}/${parsed.bin}`); } catch (e) { return null; }
-      if (buf && ArrayBuffer.isView(buf)) buf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-      if (!buf || buf.byteLength !== parsed.floats * 4) return null;
-      return this._attachVectors(vectors, new Float32Array(buf)) ? vectors : null;
+    const f32 = (v) => (Array.isArray(v) ? Float32Array.from(v) : v);
+    for (const entry of Object.values(vectors)) {
+      if (!entry || typeof entry !== 'object') return null;
+      for (const k of ['noteVec', 'bodyVec', 'titleVec']) if (k in entry) entry[k] = f32(entry[k]);
+      for (const blk of Array.isArray(entry.blocks) ? entry.blocks : []) if (blk && 'vec' in blk) blk.vec = f32(blk.vec);
     }
-    if (parsed.format === 4 || parsed.format === 3 || parsed.format === 2) {
-      if (parsed.format !== 4) this.migrateStore(vectors, parsed.format);
-      const f32 = (v) => (Array.isArray(v) ? Float32Array.from(v) : v);
-      for (const entry of Object.values(vectors)) {
-        if (!entry || typeof entry !== 'object') return null;
-        for (const k of ['noteVec', 'bodyVec', 'titleVec']) if (k in entry) entry[k] = f32(entry[k]);
-        for (const blk of Array.isArray(entry.blocks) ? entry.blocks : []) if (blk && 'vec' in blk) blk.vec = f32(blk.vec);
-      }
-      return vectors;
-    }
-    return null;
+    return vectors;
   }
 
   // One-time conversion of an old vectors.json to vectors.bin. The old file is
@@ -1370,56 +1354,19 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
     const cmp = compareStores(fresh, disk.vectors);
     if (!cmp.ok) return { ok: false, reason: cmp.reason };
 
-    // 4. For inline-number files, also check every float against the original
-    //    JSON number itself (catches a fault in the conversion step, which
-    //    steps 1-3 share).
-    if (legacy.format >= 2 && legacy.format <= 4) {
-      const raw = await this._readJson(legacy.path);
-      const r = compareRawNumbers(raw && raw.vectors, disk.vectors, legacy.format);
-      if (!r.ok) return { ok: false, reason: r.reason };
-    }
+    // 4. Also check every float against the original JSON number itself
+    //    (catches a fault in the conversion step, which steps 1-3 share).
+    const raw = await this._readJson(legacy.path);
+    const r = compareRawNumbers(raw && raw.vectors, disk.vectors);
+    if (!r.ok) return { ok: false, reason: r.reason };
     return { ok: true, checked: cmp.vectors };
   }
 
-  // Remove vectors.json, its scratch copy, and any v5 vectors-<id>.bin.
+  // Remove vectors.json and its scratch copy.
   async _deleteLegacy() {
     const adapter = this.app.vault.adapter;
     for (const path of [this.legacyJsonPath, this.legacyJsonTmpPath]) {
       try { if (await adapter.exists(path)) await adapter.remove(path); } catch (e) { /* retried next launch */ }
-    }
-    if (!adapter.list) return;
-    let listing;
-    try { listing = await adapter.list(this.storeDir); } catch (e) { return; }
-    for (const full of (listing && listing.files) || []) {
-      if (!/^vectors-[a-z0-9]+\.bin$/.test(full.split('/').pop())) continue;
-      try { await adapter.remove(full); } catch (e) { /* retried next launch */ }
-    }
-  }
-
-  // Migrate an older cache in place to the current format. The point is to avoid
-  // a full rebuild: we keep every vector we can and let the next embed pass fill
-  // in only what's genuinely new.
-  //
-  //   v2 -> v4: noteVec was body-only back then, so drop it (it'll be recomputed
-  //             as title+body). titleVec and blocks are kept.
-  //   v3 -> v4: everything is kept; we only need the new bodyVec, which the next
-  //             pass computes (free for single-block notes, one embed otherwise).
-  //
-  // We seed titleHash/bodyHash from data already in the cache (body is exactly
-  // the stored block texts joined), so the next pass sees title+body as
-  // unchanged and reuses titleVec/noteVec/blocks — it embeds ONLY the missing
-  // bodyVec. Clearing mtime is what forces that one pass to run.
-  migrateStore(vectors, fromFormat) {
-    for (const [path, entry] of Object.entries(vectors)) {
-      if (!entry) continue;
-      const basename = (path.split('/').pop() || '').replace(/\.md$/i, '');
-      const body = Array.isArray(entry.blocks) ? entry.blocks.map((b) => b.text).join('\n\n') : '';
-      entry.titleHash = hashString(basename);
-      entry.bodyHash = hashString(body);
-      delete entry.hash;   // old combined hash, no longer used
-      delete entry.mtime;  // force one pass to fill in bodyVec
-      if (fromFormat < 3) delete entry.noteVec; // v2 noteVec was body-only
-      // bodyVec intentionally left absent -> computed on the next pass
     }
   }
 
@@ -3325,7 +3272,6 @@ class LocalConnectionsSettingTab extends PluginSettingTab {
         break;
       }
       case 'int':
-      case 'number':
         s.addText((t) => {
           if (t.inputEl) t.inputEl.type = 'number';
           t.setValue(String(val)).onChange((v) => this.commit(item, v));
