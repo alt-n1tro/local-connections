@@ -189,6 +189,8 @@ const SETTINGS_SCHEMA = [
         desc: 'You’ve already made those connections.\nDefault: on' },
       { key: 'DEFAULT_TAB', name: 'Open on', type: 'select', options: { notes: 'Notes', blocks: 'Blocks' },
         desc: 'Which tab the panel shows first.\nDefault: Notes' },
+      { key: 'GRAVITY_ENABLED', name: 'Show Gravity', type: 'toggle',
+        desc: 'A small box at the top of the Notes tab with notes your recent writing keeps returning to.\nDefault: on' },
     ],
   },
   {
@@ -266,10 +268,8 @@ const SETTINGS_SCHEMA = [
   {
     name: 'Gravity',
     advanced: true,
-    desc: 'Notes your recent writing keeps returning to, shown at the top of the Notes tab.',
+    desc: 'Fine-tuning for the Gravity box. Turn the box itself on or off with \u201CShow Gravity\u201D under Results.',
     items: [
-      { key: 'GRAVITY_ENABLED', name: 'Enabled', type: 'toggle',
-        desc: 'Default: on' },
       { key: 'GRAVITY_RECENT_N', name: 'Recent notes considered', type: 'int', min: 3,
         desc: 'Default: 30' },
       { key: 'GRAVITY_TOP_K', name: 'Neighbours per note', type: 'int', min: 1,
@@ -2143,8 +2143,11 @@ class ConnectionsView extends ItemView {
     super(leaf);
     this.plugin = plugin;
     this.activeTab = TUNABLES.DEFAULT_TAB === 'blocks' ? 'blocks' : 'notes';
-    // remember which rows the user has expanded, keyed by file path, so a
-    // re-render (e.g. debounced refresh) doesn't collapse them.
+    // remember which rows the user has expanded, so a re-render (e.g. debounced
+    // refresh) doesn't collapse them. Keyed by "<list>:<file path>" (list =
+    // gravity | notes | pairs): the same note can sit in the Gravity box AND
+    // the list below it, and opening one must not open the other — that grew
+    // the box and shoved the whole list down, losing your place.
     this.expanded = new Set();
     // rows whose (long) title the user clicked to see in full, same keying.
     this.titleExpanded = new Set();
@@ -2582,7 +2585,7 @@ class ConnectionsView extends ItemView {
       if (!collapsed) {
         for (const hit of gravity) {
           const nb = hit.count === 1 ? 'neighbourhood' : 'neighbourhoods';
-          const row = this._renderNoteRow(cage, hit, currentFile, linkedSet, 'lc-gravity-row');
+          const row = this._renderNoteRow(cage, hit, currentFile, linkedSet, 'lc-gravity-row', { scope: 'gravity' });
           if (row) row.setAttr('title', `In ${hit.count} recent ${nb}`);
         }
       }
@@ -2598,16 +2601,19 @@ class ConnectionsView extends ItemView {
   // the Pairs tab, so all three look and behave identically. `extraWrapClass`
   // adds a marker class to the row's wrapper. `opts` lets a caller override the
   // score text/tooltip and add an always-visible sub-line under the row (Pairs
-  // uses this to show its delta and the body/title breakdown). Returns the row
-  // element so callers can annotate it (Gravity puts its count in a tooltip).
+  // uses this to show its delta and the body/title breakdown). `opts.scope`
+  // names the list the row belongs to ('gravity' | 'notes' | 'pairs'), so each
+  // list keeps its own expanded rows. Returns the row element so callers can
+  // annotate it (Gravity puts its count in a tooltip).
   _renderNoteRow(list, r, currentFile, linkedSet, extraWrapClass, opts) {
     opts = opts || {};
+    const key = `${opts.scope || 'notes'}:${r.file.path}`;
     const linked = this.isResultLinked(r.file, linkedSet);
     const item = list.createDiv({ cls: 'lc-item-wrap' + (extraWrapClass ? ' ' + extraWrapClass : '') });
     const row = item.createDiv({ cls: 'lc-item' + (linked ? ' lc-linked' : '') });
 
     // expand/collapse caret
-    const isOpen = this.expanded.has(r.file.path);
+    const isOpen = this.expanded.has(key);
     const caret = row.createSpan({ cls: 'lc-caret', text: isOpen ? '\u25BD' : '\u25B7' });
     caret.setAttr('title', isOpen ? 'Collapse' : 'Expand title & body');
 
@@ -2640,11 +2646,11 @@ class ConnectionsView extends ItemView {
 
     // clicking the caret toggles the dropdown
     const toggle = async () => {
-      if (this.expanded.has(r.file.path)) {
-        this.expanded.delete(r.file.path);
-        this.titleExpanded.delete(r.file.path); // collapse resets the title too
+      if (this.expanded.has(key)) {
+        this.expanded.delete(key);
+        this.titleExpanded.delete(key); // collapse resets the title too
       } else {
-        this.expanded.add(r.file.path);
+        this.expanded.add(key);
       }
       this.render();
     };
@@ -2658,7 +2664,7 @@ class ConnectionsView extends ItemView {
       const fullTitle = r.file.basename.replace(/\s+/g, ' ').trim();
       const shortTitle = truncate(r.file.basename, TUNABLES.NOTE_TITLE_MAX_CHARS);
       const clipped = shortTitle !== fullTitle;
-      const titleOpen = this.titleExpanded.has(r.file.path);
+      const titleOpen = this.titleExpanded.has(key);
       const titleEl = drop.createDiv({
         cls: 'lc-drop-title' + (clipped ? ' lc-drop-title-clipped' : ''),
         text: titleOpen ? fullTitle : shortTitle,
@@ -2667,8 +2673,8 @@ class ConnectionsView extends ItemView {
         titleEl.setAttr('title', titleOpen ? 'Click to shorten' : 'Click to show the full title');
         titleEl.addEventListener('click', (evt) => {
           evt.stopPropagation();
-          if (titleOpen) this.titleExpanded.delete(r.file.path);
-          else this.titleExpanded.add(r.file.path);
+          if (titleOpen) this.titleExpanded.delete(key);
+          else this.titleExpanded.add(key);
           this.render();
         });
       }
@@ -2702,6 +2708,7 @@ class ConnectionsView extends ItemView {
     // the difference (strangeness) sits top-left, body/title on the sub-line.
     for (const r of this.sortedStrange(strange)) {
       this._renderNoteRow(list, r, currentFile, linkedSet, 'lc-strange-row', {
+        scope: 'pairs',
         scoreText: r.delta.toFixed(dec),
         scoreTitle: 'Strangeness: how much more the bodies agree than the titles',
         // No "diff" here: it's already the top-left number, whatever the sort.
