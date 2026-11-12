@@ -2,7 +2,13 @@
 
 An Obsidian plugin that shows which of your notes are related to the one you're reading. It runs on your own computer through Ollama, so your notes never leave your machine and there's nothing to pay for.
 
-I made it to replace Smart Connections after its Ollama support went behind a paywall.
+## Author Note / How things came to be
+
+A similar (most popular) plugin for this problem (semantic cosine similarity) kept triggering a weird graphics bug/freeze on my MacBook, which then forced a full reboot after ~10 minutes of writing. Therefore, I started writing my own plugin. I wanted a free and minimalist design. No bells and whistles. Just does what it says and the user stays 100% in control with as little distractions as possible. Everything is local, no data collection. 
+
+I do hope you enjoy this plugin. 
+
+If you have any suggestions or recommendations, please [open an Issue](https://github.com/alt-n1tro/local-connections/issues/new) and I will look into it. :)
 
 ## What it does
 
