@@ -20,7 +20,7 @@ Also in the panel:
 
 - **Semantic search**: type a sentence and find notes and paragraphs by meaning, not exact words.
 - **Drift**: how well the current note's title still fits what you wrote. Click it to see which paragraphs drift away from it.
-- **Gravity**: at the top of the Notes tab, notes your recent writing keeps coming back to.
+- **Gravity**: a small box at the top of the Notes tab with notes your recent writing keeps coming back to. You can turn it off in the settings.
 - **Pause**: stops re-indexing while you write. It catches up when you resume.
 
 ## Setup
