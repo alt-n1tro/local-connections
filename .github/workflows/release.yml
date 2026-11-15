@@ -91,7 +91,10 @@ jobs:
           id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
             --jq ".[] | select(.tag_name == \"$VERSION\" and .draft) | .id")
           # Point the draft at this commit, then attach (replacing any old copies).
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -f target_commitish="$GITHUB_SHA" > /dev/null
+          # tag_name must be sent along: an update without it detaches a draft
+          # from its tag, and the release then publishes as "untagged-…".
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" \
+            -f tag_name="$VERSION" -f target_commitish="$GITHUB_SHA" > /dev/null
           for f in main.js manifest.json styles.css; do
             old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$id/assets" --jq ".[] | select(.name == \"$f\") | .id")
             [ -n "$old" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
