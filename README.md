@@ -75,6 +75,7 @@ Removed before indexing:
 
 - properties at the top of the note (tags, aliases, dates and every other property)
 - comments (`%% … %%` and `<!-- … -->`) and block IDs like `^a1b2c3`
+- the names of linked notes: `[[Note]]` is left out, and for `[[Note|shown text]]` only the shown text counts
 - code blocks, images and embeds
 - horizontal rules (`---`)
 - lines that are only a tag, like `#idea`

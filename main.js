@@ -513,7 +513,8 @@ function compareRawNumbers(raw, conv) {
 //   1 = original rules
 //   2 = + fenced code blocks stripped, + images/embeds stripped
 //   3 = + properties (frontmatter), comments and block IDs stripped
-const CLEAN_VERSION = 3;
+//   4 = + wikilinks: target note names removed, only the shown text kept
+const CLEAN_VERSION = 4;
 
 // ---------- pure utilities ----------
 
@@ -543,6 +544,19 @@ function cosine(a, b) {
 function powerScale(raw) {
   const clamped = raw < 0 ? 0 : raw;
   return Math.pow(clamped, TUNABLES.BETA);
+}
+
+// Wikilinks: the linked note's NAME is never part of your writing, so it must
+// not count. "[[Note]]" is removed; "[[Note|shown text]]" (also the table form
+// "[[Note\|shown text]]") keeps only the shown text. A removed link takes the
+// space in front of it along, so "two [[X]] and" becomes "two and".
+function stripWikilinks(line) {
+  return line.replace(/( ?)\[\[([^\[\]\n]*)\]\]/g, (m, space, inner) => {
+    const pipe = inner.search(/\\?\|/);
+    if (pipe === -1) return '';
+    const shown = inner.slice(pipe + (inner[pipe] === '\\' ? 2 : 1)).trim();
+    return shown ? space + shown : '';
+  });
 }
 
 // Split note body into blocks. Strips metadata + "->" footer, splits on blank
@@ -585,7 +599,12 @@ function splitIntoBlocks(content) {
     // or "[00:02:56 - 00:02:57] UNKNOWN" — carries no meaning, drop it (and
     // don't let it count toward MIN_BLOCK_CHARS on the utterance below).
     if (/^\[\d{1,2}:\d{2}:\d{2}\s*-\s*\d{1,2}:\d{2}:\d{2}\]\s+(SPEAKER_\d+|UNKNOWN)\s*$/.test(t)) continue;
-    cleaned.push(line);
+    const unlinked = stripWikilinks(line);
+    // A line that was nothing but links (e.g. a "- [[Note]]" list item) leaves
+    // an empty bullet / heading marker behind: drop the line altogether. Only
+    // lines that actually had a link are touched.
+    if (unlinked !== line && /^\s*(?:[-*+>]|\d+\.|#{1,6})?\s*$/.test(unlinked)) continue;
+    cleaned.push(unlinked);
   }
   const text = cleaned.join('\n');
 
