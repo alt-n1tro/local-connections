@@ -514,7 +514,9 @@ function compareRawNumbers(raw, conv) {
 //   2 = + fenced code blocks stripped, + images/embeds stripped
 //   3 = + properties (frontmatter), comments and block IDs stripped
 //   4 = + wikilinks: target note names removed, only the shown text kept
-const CLEAN_VERSION = 4;
+//   5 = + markdown links keep only their text; unclosed/nested code fences,
+//       tag lines, horizontal rules and image URLs handled properly
+const CLEAN_VERSION = 5;
 
 // ---------- pure utilities ----------
 
@@ -546,17 +548,58 @@ function powerScale(raw) {
   return Math.pow(clamped, TUNABLES.BETA);
 }
 
-// Wikilinks: the linked note's NAME is never part of your writing, so it must
-// not count. "[[Note]]" is removed; "[[Note|shown text]]" (also the table form
-// "[[Note\|shown text]]") keeps only the shown text. A removed link takes the
-// space in front of it along, so "two [[X]] and" becomes "two and".
-function stripWikilinks(line) {
-  return line.replace(/( ?)\[\[([^\[\]\n]*)\]\]/g, (m, space, inner) => {
-    const pipe = inner.search(/\\?\|/);
-    if (pipe === -1) return '';
-    const shown = inner.slice(pipe + (inner[pipe] === '\\' ? 2 : 1)).trim();
-    return shown ? space + shown : '';
-  });
+// Links: where a link points is never part of your writing, so it must not
+// count. Only the text you see in its place does.
+//   [[Note]]                 -> removed
+//   [[Note|shown text]]      -> shown text   (also the table form [[Note\|shown text]])
+//   [shown text](https://…)  -> shown text   (URL, <url> and "title" all dropped)
+// A link that disappears takes the space in front of it along ("two [[X]] and"
+// -> "two and"), unless a letter follows directly ("the [[X]]s" -> "the s").
+// URLs may contain one level of brackets, e.g. …/Foo_(bar).
+function stripLinks(line) {
+  const gone = (space, next) => (space && /[\p{L}\p{N}]/u.test(next || '') ? space : '');
+  const out = line
+    .replace(/( ?)\[\[([^\[\]\n]*)\]\]/g, (m, space, inner, at, str) => {
+      const pipe = inner.search(/\\?\|/);
+      const shown = pipe === -1 ? '' : inner.slice(pipe + (inner[pipe] === '\\' ? 2 : 1)).trim();
+      return shown ? space + shown : gone(space, str[at + m.length]);
+    })
+    .replace(/( ?)\[((?:[^\[\]\n]|\[[^\[\]\n]*\])*)\]\((?:[^()\n]|\([^()\n]*\))*\)/g, (m, space, text, at, str) => {
+      const shown = text.trim();
+      return shown ? space + shown : gone(space, str[at + m.length]);
+    });
+  if (out === line) return line;
+  // A link removed from the start of a line leaves a stray space there: keep
+  // the line's own indentation, nothing more.
+  const indent = /^[ \t]*/.exec(line)[0];
+  return out.startsWith(indent) ? indent + out.slice(indent.length).replace(/^ +/, '') : out;
+}
+
+// Remove fenced code blocks (``` or ~~~), line by line, the way Markdown reads
+// them: a fence opens only at the start of a line (indentation, ">" quote marks
+// and a list marker may come first), closes on a line with the same character
+// repeated at least as often, and runs to the end of the note if never closed.
+// Each block is replaced by one empty line, so the text around it stays apart.
+function stripFencedCode(content) {
+  const out = [];
+  let fence = null;
+  for (const raw of content.split('\n')) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (!fence) {
+      const open = /^[ \t>]*(?:(?:[-*+]|\d+[.)])[ \t]+)?(`{3,}|~{3,})(.*)$/.exec(line);
+      // "```like this```" on one line is inline code, not a fence.
+      if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
+        fence = { ch: open[1][0], len: open[1].length };
+        out.push('');
+      } else {
+        out.push(raw);
+      }
+    } else {
+      const close = /^[ \t>]*(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (close && close[1][0] === fence.ch && close[1].length >= fence.len) fence = null;
+    }
+  }
+  return out.join('\n');
 }
 
 // Split note body into blocks. Strips metadata + "->" footer, splits on blank
@@ -570,7 +613,7 @@ function splitIntoBlocks(content) {
   // Drop fenced code blocks (```lang … ``` or ~~~ … ~~~) — diagrams and code
   // (tikz, etc.) carry no prose meaning, so they shouldn't skew the note/body
   // vectors or the title↔body drift.
-  content = content.replace(/(```|~~~)[\s\S]*?\1/g, '\n');
+  content = stripFencedCode(content);
   // Drop embeds and images. "![[file.jpeg|341]]" is a filename, not prose — but
   // it's long enough to clear MIN_BLOCK_CHARS, so it used to survive as a block
   // and then match OTHER image blocks (filename-to-filename similarity), which
@@ -579,7 +622,7 @@ function splitIntoBlocks(content) {
   // left with nothing but an image falls below MIN_BLOCK_CHARS and is dropped.
   content = content
     .replace(/!\[\[[^\]]*\]\]/g, ' ')          // Obsidian embed: ![[img.png|300]]
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')     // markdown image: ![alt](url)
+    .replace(/!\[[^\]]*\]\((?:[^()]|\([^()]*\))*\)/g, ' ') // markdown image: ![alt](url)
     .replace(/<img\b[^>]*>/gi, ' ')            // raw HTML image
     // Comments are hidden in reading view, so they aren't part of the writing.
     .replace(/%%[\s\S]*?%%/g, ' ')              // Obsidian comment: %% ... %%
@@ -592,18 +635,20 @@ function splitIntoBlocks(content) {
     const t = line.trim();
     if (/^Date:\s/i.test(t)) continue;
     if (/^epistemic_status:/i.test(t)) continue;
-    if (/^#\w+$/.test(t)) continue;      // lone tag line
-    if (/^-{3,}$/.test(t)) continue;     // horizontal rule
+    if (/^(?:#[^\s#]+[ \t]*)+$/.test(t)) continue;      // line of only tags: #idea #topic/sub
+    if (/^([-*_])(?:[ \t]*\1){2,}$/.test(t)) continue;  // horizontal rule: --- *** ___ - - -
+    // Link reference definition, e.g. "[1]: https://example.com" (not rendered).
+    if (/^\[(?!\^)[^\]]+\]:\s*<?(?:[a-z][a-z0-9+.-]*:\/\/|www\.|mailto:)\S*>?(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?$/i.test(t)) continue;
     if (/^->/.test(t)) continue;         // trailing source-link footer
     // transcript diarization header, e.g. "[00:02:56 - 00:02:57] SPEAKER_00"
     // or "[00:02:56 - 00:02:57] UNKNOWN" — carries no meaning, drop it (and
     // don't let it count toward MIN_BLOCK_CHARS on the utterance below).
     if (/^\[\d{1,2}:\d{2}:\d{2}\s*-\s*\d{1,2}:\d{2}:\d{2}\]\s+(SPEAKER_\d+|UNKNOWN)\s*$/.test(t)) continue;
-    const unlinked = stripWikilinks(line);
-    // A line that was nothing but links (e.g. a "- [[Note]]" list item) leaves
-    // an empty bullet / heading marker behind: drop the line altogether. Only
-    // lines that actually had a link are touched.
-    if (unlinked !== line && /^\s*(?:[-*+>]|\d+\.|#{1,6})?\s*$/.test(unlinked)) continue;
+    const unlinked = stripLinks(line);
+    // A line that was nothing but links (e.g. a "- [[Note]]" list item, or
+    // "[[A]], [[B]]") leaves only markers and punctuation behind: drop the
+    // line altogether. Only lines that actually had a link are touched.
+    if (unlinked !== line && !/[\p{L}\p{N}]/u.test(unlinked)) continue;
     cleaned.push(unlinked);
   }
   const text = cleaned.join('\n');
@@ -641,6 +686,20 @@ function extractOutgoingLinks(content) {
     if (pipe !== -1) inner = inner.slice(0, pipe);
     inner = inner.split('#')[0].split('^')[0].trim();
     if (inner) targets.add(inner.toLowerCase());
+  }
+  // Markdown-style links to notes: [text](Folder/Note.md), [text](Note%20name).
+  // Anything with a scheme (https:, mailto:, obsidian:, ...) is external.
+  const md = /\[(?:[^\[\]\n]|\[[^\[\]\n]*\])*\]\(((?:[^()\n]|\([^()\n]*\))*)\)/g;
+  while ((m = md.exec(content)) !== null) {
+    let dest = m[1].trim();
+    if (dest.startsWith('<')) dest = dest.slice(1).split('>')[0];
+    else dest = dest.split(/\s+["'(]/)[0];
+    if (!dest || /^[a-z][a-z0-9+.-]*:/i.test(dest)) continue;
+    try { dest = decodeURIComponent(dest); } catch (e) { /* keep as written */ }
+    dest = dest.split('#')[0].replace(/\.md$/i, '').replace(/^(?:\.{1,2}\/)+/, '').trim();
+    if (!dest) continue;
+    targets.add(dest.toLowerCase());
+    targets.add(dest.split('/').pop().toLowerCase()); // relative paths: match by name
   }
   return targets;
 }

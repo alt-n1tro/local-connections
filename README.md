@@ -69,20 +69,44 @@ If you skip step 4, nothing is indexed and the panel stays paused. Click **Pause
 
 ## What gets indexed
 
-Only notes inside the folders you pick. For each note, the plugin reads the whole file, removes the parts that aren't writing, and then splits the rest into paragraphs (text separated by blank lines; a list stays with the paragraph above it).
+Only notes inside the folders you pick. Before a note is sent to the model, the plugin cleans it, so that only what you actually wrote is compared. The panel shows the cleaned text, so what you see there is exactly what was indexed. Your files are never changed.
 
-Removed before indexing:
+**1. Parts that aren't writing are removed**
 
 - properties at the top of the note (tags, aliases, dates and every other property)
+- code blocks (` ``` ` or `~~~`), images and embedded notes or files
 - comments (`%% … %%` and `<!-- … -->`) and block IDs like `^a1b2c3`
-- the names of linked notes: `[[Note]]` is left out, and for `[[Note|shown text]]` only the shown text counts
-- code blocks, images and embeds
-- horizontal rules (`---`)
-- lines that are only a tag, like `#idea`
+- horizontal rules (`---`, `***`, `___`)
+- lines that contain only tags, like `#idea #topic/sub`
+- link reference lines, like `[1]: https://example.com`
 - lines starting with `Date:`, `epistemic_status:` or `->`
 - transcript timestamps, like `[00:02:56 - 00:02:57] SPEAKER_00`
 
-Notes with less than 100 characters left are skipped, and paragraphs under 40 characters don't count as blocks. A note longer than about 28,000 characters is matched by its paragraphs only, because the model can't read that much at once. The note's title counts towards its whole-note match. All of these limits can be changed under **Advanced settings**.
+**2. Links keep only the words you see**
+
+Where a link points to is not your writing, so it doesn't count.
+
+| You wrote | What is indexed |
+|---|---|
+| `the [[Vector Dot Product\|dot product]] of two vectors` | the dot product of two vectors |
+| `it builds on [[Some Other Note]] and more` | it builds on and more |
+| `read [the docs](https://example.com/page) first` | read the docs first |
+
+A line that held nothing but links, such as a `- [[Note]]` list item, is dropped.
+
+**3. The rest is split into paragraphs**
+
+A paragraph is text separated by blank lines. A list stays with the paragraph above it. Each paragraph is indexed separately (the Blocks tab), and the whole note is indexed once, together with its title (the Notes tab).
+
+**4. Very short and very long texts**
+
+- Notes with fewer than 100 characters left after cleaning are skipped.
+- Paragraphs under 40 characters don't count as blocks.
+- A note longer than about 28,000 characters is matched by its paragraphs only, because the model can't read that much at once.
+
+These limits can be changed under **Advanced settings**.
+
+**What stays in:** everything else, including headings, inline code, text in tables and callouts, tags inside a sentence, math, and web addresses written out as plain text.
 
 ## Settings
 
