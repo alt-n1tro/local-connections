@@ -7,3 +7,5 @@ test_main.js
 *.bak
 .DS_Store
 .claude/
+vectors.bin
+vectors.bin.tmp
