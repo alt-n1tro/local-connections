@@ -21,7 +21,7 @@ const TUNABLES = {
   // --- power scaling ---
   // Sorting/threshold uses scaled = rawCosine ^ BETA.
   // BETA > 1 spreads out a bunched high-similarity distribution (bge-m3 tends
-  // to cluster scores). Your prior Smart Connections tuning used ~3. Try 1
+  // to cluster scores). 3 works well in practice. Try 1
   // (off), 2, 3, 4. Larger BETA exaggerates differences among top results.
   BETA: 3,
 
@@ -335,7 +335,7 @@ function coerceSetting(item, raw, fallback) {
       return typeof raw === 'string' ? raw : (raw == null ? fallback : String(raw));
     case 'folders': {
       // Strip surrounding slashes: isExcluded() matches on `folder + '/'`, so a
-      // pasted "5 - Permanent Notes/" would otherwise never match anything and
+      // pasted "Notes/" would otherwise never match anything and
       // silently index nothing.
       // A lone "/" means the whole vault and is kept as-is.
       const clean = (list) => {
@@ -506,13 +506,14 @@ function compareRawNumbers(raw, conv) {
 // Why this exists: embedFile() skips a note entirely when its mtime is unchanged,
 // without ever reading the file. So changing the cleaning rules would NOT
 // re-process existing notes — the change silently applied only to notes you
-// happened to edit afterwards. (That's how the code-fence strip failed to take:
-// 111 already-cached blocks kept their fences.) Each entry records the cleaning
+// happened to edit afterwards. (That's how the code-fence strip once failed to
+// take: already-cached blocks kept their fences.) Each entry records the cleaning
 // version it was built with; a mismatch defeats the fast path, so exactly one
 // re-read + re-split pass happens and only genuinely changed blocks re-embed.
 //   1 = original rules
 //   2 = + fenced code blocks stripped, + images/embeds stripped
-const CLEAN_VERSION = 2;
+//   3 = + properties (frontmatter), comments and block IDs stripped
+const CLEAN_VERSION = 3;
 
 // ---------- pure utilities ----------
 
@@ -547,9 +548,14 @@ function powerScale(raw) {
 // Split note body into blocks. Strips metadata + "->" footer, splits on blank
 // lines, keeps a list attached to the paragraph above it, drops short blocks.
 function splitIntoBlocks(content) {
+  // Drop the properties block (YAML frontmatter: tags, aliases, dates, ...).
+  // Obsidian only treats it as properties when it starts on the very first
+  // line, so only a block there is removed; a "---" further down is a
+  // horizontal rule (dropped line by line below).
+  content = content.replace(/^\uFEFF?---[ \t]*\r?\n(?:[\s\S]*?\r?\n)?---[ \t]*(?:\r?\n|$)/, '');
   // Drop fenced code blocks (```lang … ``` or ~~~ … ~~~) — diagrams and code
   // (tikz, etc.) carry no prose meaning, so they shouldn't skew the note/body
-  // vectors or the title↔body drift. Mirrors stats.py's word-count rule.
+  // vectors or the title↔body drift.
   content = content.replace(/(```|~~~)[\s\S]*?\1/g, '\n');
   // Drop embeds and images. "![[file.jpeg|341]]" is a filename, not prose — but
   // it's long enough to clear MIN_BLOCK_CHARS, so it used to survive as a block
@@ -560,7 +566,12 @@ function splitIntoBlocks(content) {
   content = content
     .replace(/!\[\[[^\]]*\]\]/g, ' ')          // Obsidian embed: ![[img.png|300]]
     .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')     // markdown image: ![alt](url)
-    .replace(/<img\b[^>]*>/gi, ' ');           // raw HTML image
+    .replace(/<img\b[^>]*>/gi, ' ')            // raw HTML image
+    // Comments are hidden in reading view, so they aren't part of the writing.
+    .replace(/%%[\s\S]*?%%/g, ' ')              // Obsidian comment: %% ... %%
+    .replace(/<!--[\s\S]*?-->/g, ' ')           // HTML comment
+    // Block IDs ("... end of paragraph ^a1b2c3") are link anchors, not words.
+    .replace(/(^|[ \t])\^[A-Za-z0-9-]+[ \t]*(?=\r?$)/gm, '$1');
   const lines = content.split('\n');
   const cleaned = [];
   for (const line of lines) {
@@ -1097,7 +1108,7 @@ module.exports = class LocalConnectionsPlugin extends Plugin {
         done++;
         // Flush to disk as we go, exactly like embedVault. Without this a long
         // catch-up wrote nothing until the very end, so closing Obsidian
-        // part-way lost all of it and check_vector.py saw no progress.
+        // part-way lost all of it.
         if (done % TUNABLES.SAVE_EVERY_N === 0) await this.saveStore();
       }
       await this.saveStore();
@@ -2307,7 +2318,7 @@ class ConnectionsView extends ItemView {
 
     // Restore the scroll position after the list is (re)built. Only when we've
     // stayed on the same view context — a note switch or entering search should
-    // start at the top. Best-effort: no-op in the test DOM shim (no scrollTop).
+    // start at the top. Best-effort: does nothing where scrollTop isn't available.
     //
     // We restore TWICE: once synchronously, and once on the next animation frame.
     // The second pass matters for expandable rows whose dropdown body loads

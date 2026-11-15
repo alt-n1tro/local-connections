@@ -29,6 +29,27 @@ Also in the panel:
 - **Gravity**: a small box at the top of the Notes tab with notes your recent writing keeps coming back to. You can turn it off in the settings.
 - **Pause**: stops re-indexing while you write. It catches up when you resume.
 
+## What it looks like
+
+The panel next to a note. Here one row is expanded to show the matching note's text:
+
+![The Local Connections panel beside an open note](images/panel.webp)
+
+Clicking **Drift** shows how well each paragraph fits the note's title:
+
+![The Drift window with a score per paragraph](images/drift.webp)
+
+Semantic search finds notes by meaning, even when they don't share the words you typed:
+
+<img src="images/search.png" alt="Semantic search results for a typed sentence" width="360">
+
+## What you need
+
+- **Obsidian on a computer** (Windows, macOS or Linux). It doesn't run on mobile.
+- **[Ollama](https://ollama.com)**, running on the same computer, with the `bge-m3` model downloaded (about 1.2 GB).
+- Ollama has to be running while you use the plugin: it's needed whenever a new or edited note is indexed, and for semantic search.
+- **Memory:** roughly 30 MB per 1,000 notes of four paragraphs each, so about 300 MB for 10,000.
+
 ## Setup
 
 1. Install [Ollama](https://ollama.com) and download the model:
@@ -45,6 +66,22 @@ Also in the panel:
 The first run indexes everything in those folders, which can take a while on a big vault. After that, only notes you change are re-indexed.
 
 If you skip step 4, nothing is indexed and the panel stays paused. Click **Paused** (or **Choose folders**) to pick folders later.
+
+## What gets indexed
+
+Only notes inside the folders you pick. For each note, the plugin reads the whole file, removes the parts that aren't writing, and then splits the rest into paragraphs (text separated by blank lines; a list stays with the paragraph above it).
+
+Removed before indexing:
+
+- properties at the top of the note (tags, aliases, dates and every other property)
+- comments (`%% … %%` and `<!-- … -->`) and block IDs like `^a1b2c3`
+- code blocks, images and embeds
+- horizontal rules (`---`)
+- lines that are only a tag, like `#idea`
+- lines starting with `Date:`, `epistemic_status:` or `->`
+- transcript timestamps, like `[00:02:56 - 00:02:57] SPEAKER_00`
+
+Notes with less than 100 characters left are skipped, and paragraphs under 40 characters don't count as blocks. A note longer than about 28,000 characters is matched by its paragraphs only, because the model can't read that much at once. The note's title counts towards its whole-note match. All of these limits can be changed under **Advanced settings**.
 
 ## Settings
 
