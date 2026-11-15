@@ -4,6 +4,9 @@
 # 2. Creates GitHub artifact attestations for main.js, manifest.json and
 #    styles.css (proof they came from this repository at this commit).
 # 3. Creates a DRAFT release for that version with the three files attached.
+#    If a draft for that version already exists (e.g. one made by hand with
+#    "Draft a new release"), the files are attached to it instead. A published
+#    release is never touched.
 #
 # Then open the draft on GitHub, write the release notes and click Publish.
 # Don't attach or replace files by hand: they'd no longer match the attestations.
@@ -41,16 +44,27 @@ jobs:
           fi
           node --check main.js
           test -s styles.css
-          if gh release view "$version" > /dev/null 2>&1; then
-            echo "::notice::A release for $version already exists; nothing to do. Bump the version to make a new one."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          # Releases with this version, drafts included (drafts have no tag yet,
+          # so match on the tag name the release will get).
+          found=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$version\") | if .draft then \"draft\" else \"published\" end")
+          drafts=$(printf '%s\n' "$found" | grep -cx draft || true)
+          if printf '%s\n' "$found" | grep -qx published; then
+            echo "::notice::$version is already published; nothing to do. Bump the version to make a new one."
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+          elif [ "$drafts" -gt 1 ]; then
+            echo "::error::There are $drafts drafts for $version. Delete all but one under Releases, then use Run workflow to retry."
+            exit 1
+          elif [ "$drafts" -eq 1 ]; then
+            echo "::notice::A draft for $version already exists; attaching the files to it."
+            echo "action=upload" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "action=create" >> "$GITHUB_OUTPUT"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Attest the release files
-        if: steps.check.outputs.skip == 'false'
+        if: steps.check.outputs.action != 'skip'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
@@ -59,7 +73,7 @@ jobs:
             styles.css
 
       - name: Create draft release
-        if: steps.check.outputs.skip == 'false'
+        if: steps.check.outputs.action == 'create'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.check.outputs.version }}
@@ -67,3 +81,21 @@ jobs:
           gh release create "$VERSION" main.js manifest.json styles.css \
             --draft --target "$GITHUB_SHA" --title "$VERSION" \
             --notes "Write the release notes here, then publish."
+
+      - name: Attach files to the existing draft
+        if: steps.check.outputs.action == 'upload'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$VERSION\" and .draft) | .id")
+          # Point the draft at this commit, then attach (replacing any old copies).
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -f target_commitish="$GITHUB_SHA" > /dev/null
+          for f in main.js manifest.json styles.css; do
+            old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$id/assets" --jq ".[] | select(.name == \"$f\") | .id")
+            [ -n "$old" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+            gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$f" \
+              -H "Content-Type: application/octet-stream" --input "$f" > /dev/null
+          done
+          echo "Attached main.js, manifest.json and styles.css to the $VERSION draft."
